@@ -86,7 +86,7 @@ stuff.
 
 ### Using Homebrew
 
-You can use [Homebrew](http://brew.sh/) (on macOS or Linux)
+You can use [Homebrew](https://brew.sh/) (on macOS or Linux)
 to install fzf.
 
 ```sh
@@ -130,6 +130,8 @@ git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
 > may not be enabled by default.**
 >
 > Refer to the package documentation for more information. (e.g. `apt-cache show fzf`)
+
+[![Packaging status](https://repology.org/badge/vertical-allrepos/fzf.svg)](https://repology.org/project/fzf/versions)
 
 ### Windows
 
