@@ -6,7 +6,7 @@ Build instructions
 
 ### Prerequisites
 
-- Go 1.13 or above
+- Go 1.20 or above
 
 ### Using Makefile
 
@@ -34,14 +34,16 @@ make release
 Third-party libraries used
 --------------------------
 
-- [mattn/go-runewidth](https://github.com/mattn/go-runewidth)
-    - Licensed under [MIT](http://mattn.mit-license.org)
+- [rivo/uniseg](https://github.com/rivo/uniseg)
+    - Licensed under [MIT](https://raw.githubusercontent.com/rivo/uniseg/master/LICENSE.txt)
 - [mattn/go-shellwords](https://github.com/mattn/go-shellwords)
     - Licensed under [MIT](http://mattn.mit-license.org)
 - [mattn/go-isatty](https://github.com/mattn/go-isatty)
     - Licensed under [MIT](http://mattn.mit-license.org)
 - [tcell](https://github.com/gdamore/tcell)
     - Licensed under [Apache License 2.0](https://github.com/gdamore/tcell/blob/master/LICENSE)
+- [fastwalk](https://github.com/charlievieth/fastwalk)
+    - Licensed under [MIT](https://raw.githubusercontent.com/charlievieth/fastwalk/master/LICENSE)
 
 License
 -------

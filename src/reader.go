@@ -1,7 +1,7 @@
 package fzf
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/charlievieth/fastwalk"
 	"github.com/junegunn/fzf/src/util"
-	"github.com/saracen/walker"
 )
 
 // Reader reads from command or standard input
@@ -76,39 +76,33 @@ func (r *Reader) fin(success bool) {
 
 func (r *Reader) terminate() {
 	r.mutex.Lock()
-	defer func() { r.mutex.Unlock() }()
-
 	r.killed = true
 	if r.exec != nil && r.exec.Process != nil {
 		util.KillCommand(r.exec)
-	} else if defaultCommand != "" {
+	} else {
 		os.Stdin.Close()
 	}
+	r.mutex.Unlock()
 }
 
-func (r *Reader) restart(command string) {
+func (r *Reader) restart(command string, environ []string) {
 	r.event = int32(EvtReady)
 	r.startEventPoller()
-	success := r.readFromCommand(nil, command)
+	success := r.readFromCommand(command, environ)
 	r.fin(success)
 }
 
 // ReadSource reads data from the default command or from standard input
-func (r *Reader) ReadSource() {
+func (r *Reader) ReadSource(root string, opts walkerOpts, ignores []string) {
 	r.startEventPoller()
 	var success bool
 	if util.IsTty() {
-		// The default command for *nix requires bash
-		shell := "bash"
 		cmd := os.Getenv("FZF_DEFAULT_COMMAND")
 		if len(cmd) == 0 {
-			if defaultCommand != "" {
-				success = r.readFromCommand(&shell, defaultCommand)
-			} else {
-				success = r.readFiles()
-			}
+			success = r.readFiles(root, opts, ignores)
 		} else {
-			success = r.readFromCommand(nil, cmd)
+			// We can't export FZF_* environment variables to the default command
+			success = r.readFromCommand(cmd, nil)
 		}
 	} else {
 		success = r.readFromStdin()
@@ -117,32 +111,82 @@ func (r *Reader) ReadSource() {
 }
 
 func (r *Reader) feed(src io.Reader) {
+	/*
+		readerSlabSize, ae := strconv.Atoi(os.Getenv("SLAB_KB"))
+		if ae != nil {
+			readerSlabSize = 128 * 1024
+		} else {
+			readerSlabSize *= 1024
+		}
+		readerBufferSize, be := strconv.Atoi(os.Getenv("BUF_KB"))
+		if be != nil {
+			readerBufferSize = 64 * 1024
+		} else {
+			readerBufferSize *= 1024
+		}
+	*/
+
 	delim := byte('\n')
 	if r.delimNil {
 		delim = '\000'
 	}
-	reader := bufio.NewReaderSize(src, readerBufferSize)
+
+	slab := make([]byte, readerSlabSize)
+	leftover := []byte{}
+	var err error
 	for {
-		// ReadBytes returns err != nil if and only if the returned data does not
-		// end in delim.
-		bytea, err := reader.ReadBytes(delim)
-		byteaLen := len(bytea)
-		if byteaLen > 0 {
-			if err == nil {
-				// get rid of carriage return if under Windows:
-				if util.IsWindows() && byteaLen >= 2 && bytea[byteaLen-2] == byte('\r') {
-					bytea = bytea[:byteaLen-2]
-				} else {
-					bytea = bytea[:byteaLen-1]
-				}
-			}
-			if r.pusher(bytea) {
-				atomic.StoreInt32(&r.event, int32(EvtReadNew))
+		n := 0
+		scope := slab[:util.Min(len(slab), readerBufferSize)]
+		for i := 0; i < 100; i++ {
+			n, err = src.Read(scope)
+			if n > 0 || err != nil {
+				break
 			}
 		}
-		if err != nil {
+
+		// We're not making any progress after 100 tries. Stop.
+		if n == 0 && err == nil {
 			break
 		}
+
+		buf := slab[:n]
+		slab = slab[n:]
+
+		for len(buf) > 0 {
+			if i := bytes.IndexByte(buf, delim); i >= 0 {
+				// Found the delimiter
+				slice := buf[:i+1]
+				buf = buf[i+1:]
+				if util.IsWindows() && len(slice) >= 2 && slice[len(slice)-2] == byte('\r') {
+					slice = slice[:len(slice)-2]
+				} else {
+					slice = slice[:len(slice)-1]
+				}
+				if len(leftover) > 0 {
+					slice = append(leftover, slice...)
+					leftover = []byte{}
+				}
+				if (err == nil || len(slice) > 0) && r.pusher(slice) {
+					atomic.StoreInt32(&r.event, int32(EvtReadNew))
+				}
+			} else {
+				// Could not find the delimiter in the buffer
+				leftover = append(leftover, buf...)
+				break
+			}
+		}
+
+		if err == io.EOF {
+			leftover = append(leftover, buf...)
+			break
+		}
+
+		if len(slab) == 0 {
+			slab = make([]byte, readerSlabSize)
+		}
+	}
+	if len(leftover) > 0 && r.pusher(leftover) {
+		atomic.StoreInt32(&r.event, int32(EvtReadNew))
 	}
 }
 
@@ -151,16 +195,28 @@ func (r *Reader) readFromStdin() bool {
 	return true
 }
 
-func (r *Reader) readFiles() bool {
+func (r *Reader) readFiles(root string, opts walkerOpts, ignores []string) bool {
 	r.killed = false
-	fn := func(path string, mode os.FileInfo) error {
+	conf := fastwalk.Config{Follow: opts.follow}
+	fn := func(path string, de os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
 		path = filepath.Clean(path)
 		if path != "." {
-			isDir := mode.Mode().IsDir()
-			if isDir && filepath.Base(path)[0] == '.' {
-				return filepath.SkipDir
+			isDir := de.IsDir()
+			if isDir {
+				base := filepath.Base(path)
+				if !opts.hidden && base[0] == '.' {
+					return filepath.SkipDir
+				}
+				for _, ignore := range ignores {
+					if ignore == base {
+						return filepath.SkipDir
+					}
+				}
 			}
-			if !isDir && r.pusher([]byte(path)) {
+			if ((opts.file && !isDir) || (opts.dir && isDir)) && r.pusher([]byte(path)) {
 				atomic.StoreInt32(&r.event, int32(EvtReadNew))
 			}
 		}
@@ -171,20 +227,16 @@ func (r *Reader) readFiles() bool {
 		}
 		return nil
 	}
-	cb := walker.WithErrorCallback(func(pathname string, err error) error {
-		return nil
-	})
-	return walker.Walk(".", fn, cb) == nil
+	return fastwalk.Walk(&conf, root, fn) == nil
 }
 
-func (r *Reader) readFromCommand(shell *string, command string) bool {
+func (r *Reader) readFromCommand(command string, environ []string) bool {
 	r.mutex.Lock()
 	r.killed = false
 	r.command = &command
-	if shell != nil {
-		r.exec = util.ExecCommandWith(*shell, command, true)
-	} else {
-		r.exec = util.ExecCommand(command, true)
+	r.exec = util.ExecCommand(command, true)
+	if environ != nil {
+		r.exec.Env = environ
 	}
 	out, err := r.exec.StdoutPipe()
 	if err != nil {

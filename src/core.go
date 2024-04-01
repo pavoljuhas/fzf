@@ -1,34 +1,11 @@
-/*
-Package fzf implements fzf, a command-line fuzzy finder.
-
-The MIT License (MIT)
-
-Copyright (c) 2013-2021 Junegunn Choi
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-*/
+// Package fzf implements fzf, a command-line fuzzy finder.
 package fzf
 
 import (
 	"fmt"
 	"os"
 	"time"
+	"unsafe"
 
 	"github.com/junegunn/fzf/src/util"
 )
@@ -41,6 +18,10 @@ Matcher  -> EvtSearchProgress -> Terminal (update info)
 Matcher  -> EvtSearchFin      -> Terminal (update list)
 Matcher  -> EvtHeader         -> Terminal (update header)
 */
+
+func ustring(data []byte) string {
+	return unsafe.String(unsafe.SliceData(data), len(data))
+}
 
 // Run starts fzf
 func Run(opts *Options, version string, revision string) {
@@ -69,7 +50,7 @@ func Run(opts *Options, version string, revision string) {
 		if opts.Theme.Colored {
 			ansiProcessor = func(data []byte) (util.Chars, *[]ansiOffset) {
 				prevLineAnsiState = lineAnsiState
-				trimmed, offsets, newState := extractColor(string(data), lineAnsiState, nil)
+				trimmed, offsets, newState := extractColor(ustring(data), lineAnsiState, nil)
 				lineAnsiState = newState
 				return util.ToChars([]byte(trimmed)), offsets
 			}
@@ -77,7 +58,7 @@ func Run(opts *Options, version string, revision string) {
 			// When color is disabled but ansi option is given,
 			// we simply strip out ANSI codes from the input
 			ansiProcessor = func(data []byte) (util.Chars, *[]ansiOffset) {
-				trimmed, _, _ := extractColor(string(data), nil, nil)
+				trimmed, _, _ := extractColor(ustring(data), nil, nil)
 				return util.ToChars([]byte(trimmed)), nil
 			}
 		}
@@ -90,7 +71,7 @@ func Run(opts *Options, version string, revision string) {
 	if len(opts.WithNth) == 0 {
 		chunkList = NewChunkList(func(item *Item, data []byte) bool {
 			if len(header) < opts.HeaderLines {
-				header = append(header, string(data))
+				header = append(header, ustring(data))
 				eventBox.Set(EvtHeader, header)
 				return false
 			}
@@ -101,7 +82,7 @@ func Run(opts *Options, version string, revision string) {
 		})
 	} else {
 		chunkList = NewChunkList(func(item *Item, data []byte) bool {
-			tokens := Tokenize(string(data), opts.Delimiter)
+			tokens := Tokenize(ustring(data), opts.Delimiter)
 			if opts.Ansi && opts.Theme.Colored && len(tokens) > 1 {
 				var ansiState *ansiState
 				if prevLineAnsiState != nil {
@@ -141,26 +122,30 @@ func Run(opts *Options, version string, revision string) {
 		reader = NewReader(func(data []byte) bool {
 			return chunkList.Push(data)
 		}, eventBox, opts.ReadZero, opts.Filter == nil)
-		go reader.ReadSource()
+		go reader.ReadSource(opts.WalkerRoot, opts.WalkerOpts, opts.WalkerSkip)
 	}
 
 	// Matcher
 	forward := true
-	for _, cri := range opts.Criteria[1:] {
-		if cri == byEnd {
+	withPos := false
+	for idx := len(opts.Criteria) - 1; idx > 0; idx-- {
+		switch opts.Criteria[idx] {
+		case byChunk:
+			withPos = true
+		case byEnd:
 			forward = false
-			break
-		}
-		if cri == byBegin {
-			break
+		case byBegin:
+			forward = true
 		}
 	}
 	patternBuilder := func(runes []rune) *Pattern {
 		return BuildPattern(
-			opts.Fuzzy, opts.FuzzyAlgo, opts.Extended, opts.Case, opts.Normalize, forward,
+			opts.Fuzzy, opts.FuzzyAlgo, opts.Extended, opts.Case, opts.Normalize, forward, withPos,
 			opts.Filter == nil, opts.Nth, opts.Delimiter, runes)
 	}
-	matcher := NewMatcher(patternBuilder, sort, opts.Tac, eventBox)
+	inputRevision := 0
+	snapshotRevision := 0
+	matcher := NewMatcher(patternBuilder, sort, opts.Tac, eventBox, inputRevision)
 
 	// Filtering mode
 	if opts.Filter != nil {
@@ -185,7 +170,7 @@ func Run(opts *Options, version string, revision string) {
 					}
 					return false
 				}, eventBox, opts.ReadZero, false)
-			reader.ReadSource()
+			reader.ReadSource(opts.WalkerRoot, opts.WalkerOpts, opts.WalkerSkip)
 		} else {
 			eventBox.Unwatch(EvtReadNew)
 			eventBox.WaitFor(EvtReadFin)
@@ -216,29 +201,51 @@ func Run(opts *Options, version string, revision string) {
 
 	// Terminal I/O
 	terminal := NewTerminal(opts, eventBox)
+	maxFit := 0 // Maximum number of items that can fit on screen
+	padHeight := 0
+	heightUnknown := opts.Height.auto
+	if heightUnknown {
+		maxFit, padHeight = terminal.MaxFitAndPad()
+	}
 	deferred := opts.Select1 || opts.Exit0
 	go terminal.Loop()
-	if !deferred {
-		terminal.startChan <- true
+	if !deferred && !heightUnknown {
+		// Start right away
+		terminal.startChan <- fitpad{-1, -1}
 	}
 
 	// Event coordination
 	reading := true
-	clearCache := util.Once(false)
-	clearSelection := util.Once(false)
 	ticks := 0
 	var nextCommand *string
-	restart := func(command string) {
+	var nextEnviron []string
+	eventBox.Watch(EvtReadNew)
+	total := 0
+	query := []rune{}
+	determine := func(final bool) {
+		if heightUnknown {
+			if total >= maxFit || final {
+				deferred = false
+				heightUnknown = false
+				terminal.startChan <- fitpad{util.Min(total, maxFit), padHeight}
+			}
+		} else if deferred {
+			deferred = false
+			terminal.startChan <- fitpad{-1, -1}
+		}
+	}
+
+	useSnapshot := false
+	var snapshot []*Chunk
+	var count int
+	restart := func(command string, environ []string) {
 		reading = true
-		clearCache = util.Once(true)
-		clearSelection = util.Once(true)
 		chunkList.Clear()
 		itemIndex = 0
+		inputRevision++
 		header = make([]string, 0, opts.HeaderLines)
-		go reader.restart(command)
+		go reader.restart(command, environ)
 	}
-	eventBox.Watch(EvtReadNew)
-	query := []rune{}
 	for {
 		delay := true
 		ticks++
@@ -262,38 +269,73 @@ func Run(opts *Options, version string, revision string) {
 					os.Exit(value.(int))
 				case EvtReadNew, EvtReadFin:
 					if evt == EvtReadFin && nextCommand != nil {
-						restart(*nextCommand)
+						restart(*nextCommand, nextEnviron)
 						nextCommand = nil
+						nextEnviron = nil
 						break
 					} else {
 						reading = reading && evt == EvtReadNew
 					}
-					snapshot, count := chunkList.Snapshot()
-					terminal.UpdateCount(count, !reading, value.(*string))
+					if useSnapshot && evt == EvtReadFin {
+						useSnapshot = false
+					}
+					if !useSnapshot {
+						if snapshotRevision != inputRevision {
+							query = []rune{}
+						}
+						snapshot, count = chunkList.Snapshot()
+						snapshotRevision = inputRevision
+					}
+					total = count
+					terminal.UpdateCount(total, !reading, value.(*string))
 					if opts.Sync {
 						opts.Sync = false
-						terminal.UpdateList(PassMerger(&snapshot, opts.Tac), false)
+						terminal.UpdateList(PassMerger(&snapshot, opts.Tac, snapshotRevision))
 					}
-					matcher.Reset(snapshot, input(), false, !reading, sort, clearCache())
+					if heightUnknown && !deferred {
+						determine(!reading)
+					}
+					matcher.Reset(snapshot, input(), false, !reading, sort, snapshotRevision)
 
 				case EvtSearchNew:
 					var command *string
+					var environ []string
+					var changed bool
 					switch val := value.(type) {
 					case searchRequest:
 						sort = val.sort
 						command = val.command
+						environ = val.environ
+						changed = val.changed
+						if command != nil {
+							useSnapshot = val.sync
+						}
 					}
 					if command != nil {
 						if reading {
 							reader.terminate()
 							nextCommand = command
+							nextEnviron = environ
 						} else {
-							restart(*command)
+							restart(*command, environ)
 						}
+					}
+					if !changed {
 						break
 					}
-					snapshot, _ := chunkList.Snapshot()
-					matcher.Reset(snapshot, input(), true, !reading, sort, clearCache())
+					if !useSnapshot {
+						newSnapshot, newCount := chunkList.Snapshot()
+						// We want to avoid showing empty list when reload is triggered
+						// and the query string is changed at the same time i.e. command != nil && changed
+						if command == nil || newCount > 0 {
+							if snapshotRevision != inputRevision {
+								query = []rune{}
+							}
+							snapshot = newSnapshot
+							snapshotRevision = inputRevision
+						}
+					}
+					matcher.Reset(snapshot, input(), true, !reading, sort, snapshotRevision)
 					delay = false
 
 				case EvtSearchProgress:
@@ -313,8 +355,7 @@ func Run(opts *Options, version string, revision string) {
 						if deferred {
 							count := val.Length()
 							if opts.Select1 && count > 1 || opts.Exit0 && !opts.Select1 && count > 0 {
-								deferred = false
-								terminal.startChan <- true
+								determine(val.final)
 							} else if val.final {
 								if opts.Exit0 && count == 0 || opts.Select1 && count == 1 {
 									if opts.PrintQuery {
@@ -331,11 +372,10 @@ func Run(opts *Options, version string, revision string) {
 									}
 									os.Exit(exitNoMatch)
 								}
-								deferred = false
-								terminal.startChan <- true
+								determine(val.final)
 							}
 						}
-						terminal.UpdateList(val, clearSelection())
+						terminal.UpdateList(val)
 					}
 				}
 			}
