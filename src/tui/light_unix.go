@@ -3,7 +3,7 @@
 package tui
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -45,22 +45,29 @@ func (r *LightRenderer) initPlatform() error {
 }
 
 func (r *LightRenderer) closePlatform() {
-	// NOOP
+	r.ttyout.Close()
 }
 
-func openTtyIn() *os.File {
-	in, err := os.OpenFile(consoleDevice, syscall.O_RDONLY, 0)
+func openTty(mode int) (*os.File, error) {
+	in, err := os.OpenFile(consoleDevice, mode, 0)
 	if err != nil {
 		tty := ttyname()
 		if len(tty) > 0 {
-			if in, err := os.OpenFile(tty, syscall.O_RDONLY, 0); err == nil {
-				return in
+			if in, err := os.OpenFile(tty, mode, 0); err == nil {
+				return in, nil
 			}
 		}
-		fmt.Fprintln(os.Stderr, "Failed to open "+consoleDevice)
-		os.Exit(2)
+		return nil, errors.New("failed to open " + consoleDevice)
 	}
-	return in
+	return in, nil
+}
+
+func openTtyIn() (*os.File, error) {
+	return openTty(syscall.O_RDONLY)
+}
+
+func openTtyOut() (*os.File, error) {
+	return openTty(syscall.O_WRONLY)
 }
 
 func (r *LightRenderer) setupTerminal() {
@@ -86,9 +93,14 @@ func (r *LightRenderer) updateTerminalSize() {
 func (r *LightRenderer) findOffset() (row int, col int) {
 	r.csi("6n")
 	r.flush()
+	var err error
 	bytes := []byte{}
 	for tries := 0; tries < offsetPollTries; tries++ {
-		bytes = r.getBytesInternal(bytes, tries > 0)
+		bytes, err = r.getBytesInternal(bytes, tries > 0)
+		if err != nil {
+			return -1, -1
+		}
+
 		offsets := offsetRegexp.FindSubmatch(bytes)
 		if len(offsets) > 3 {
 			// Add anything we skipped over to the input buffer

@@ -4,12 +4,14 @@
 #  / __/ / /_/ __/
 # /_/   /___/_/ completion.bash
 #
-# - $FZF_TMUX               (default: 0)
-# - $FZF_TMUX_OPTS          (default: empty)
-# - $FZF_COMPLETION_TRIGGER (default: '**')
-# - $FZF_COMPLETION_OPTS    (default: empty)
+# - $FZF_TMUX                 (default: 0)
+# - $FZF_TMUX_OPTS            (default: empty)
+# - $FZF_COMPLETION_TRIGGER   (default: '**')
+# - $FZF_COMPLETION_OPTS      (default: empty)
+# - $FZF_COMPLETION_PATH_OPTS (default: empty)
+# - $FZF_COMPLETION_DIR_OPTS  (default: empty)
 
-[[ $- =~ i ]] || return 0
+if [[ $- =~ i ]]; then
 
 
 # To use custom commands instead of find, override _fzf_compgen_{path,dir}
@@ -31,6 +33,14 @@
 
 # To redraw line after fzf closes (printf '\e[5n')
 bind '"\e[0n": redraw-current-line' 2> /dev/null
+
+__fzf_defaults() {
+  # $1: Prepend to FZF_DEFAULT_OPTS_FILE and FZF_DEFAULT_OPTS
+  # $2: Append to FZF_DEFAULT_OPTS_FILE and FZF_DEFAULT_OPTS
+  echo "--height ${FZF_TMUX_HEIGHT:-40%} --bind=ctrl-z:ignore $1"
+  command cat "${FZF_DEFAULT_OPTS_FILE-}" 2> /dev/null
+  echo "${FZF_DEFAULT_OPTS-} $2"
+}
 
 __fzf_comprun() {
   if [[ "$(type -t _fzf_comprun 2>&1)" = function ]]; then
@@ -91,129 +101,86 @@ _fzf_opts_completion() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
   opts="
-    -h --help
-    -x --extended
-    -e --exact
-    --extended-exact
-    +x --no-extended
-    +e --no-exact
-    -q --query
-    -f --filter
-    --literal
-    --no-literal
-    --algo
-    --scheme
-    --expect
-    --no-expect
-    --enabled --no-phony
-    --disabled --phony
-    --tiebreak
-    --bind
-    --color
-    --toggle-sort
-    -d --delimiter
-    -n --nth
-    --with-nth
-    -s --sort
-    +s --no-sort
-    --track
-    --no-track
-    --tac
-    --no-tac
-    -i
-    +i
-    -m --multi
-    +m --no-multi
-    --ansi
-    --no-ansi
-    --no-mouse
     +c --no-color
-    +2 --no-256
-    --black
-    --no-black
-    --bold
-    --no-bold
-    --layout
-    --reverse
-    --no-reverse
-    --cycle
-    --no-cycle
-    --keep-right
-    --no-keep-right
-    --hscroll
-    --no-hscroll
-    --hscroll-off
-    --scroll-off
-    --filepath-word
-    --no-filepath-word
-    --info
-    --no-info
-    --inline-info
-    --no-inline-info
-    --separator
-    --no-separator
-    --scrollbar
-    --no-scrollbar
-    --jump-labels
-    -1 --select-1
-    +1 --no-select-1
-    -0 --exit-0
-    +0 --no-exit-0
-    --read0
-    --no-read0
-    --print0
-    --no-print0
-    --print-query
-    --no-print-query
-    --prompt
-    --pointer
-    --marker
-    --sync
-    --no-sync
-    --async
-    --no-history
-    --history
-    --history-size
-    --no-header
-    --no-header-lines
-    --header
-    --header-lines
-    --header-first
-    --no-header-first
-    --ellipsis
-    --preview
-    --no-preview
-    --preview-window
-    --height
-    --min-height
-    --no-height
-    --no-margin
-    --no-padding
-    --no-border
+    +i --no-ignore-case
+    +s --no-sort
+    +x --no-extended
+    --ansi
+    --bash
+    --bind
     --border
-    --no-border-label
     --border-label
     --border-label-pos
-    --no-preview-label
+    --color
+    --cycle
+    --disabled
+    --ellipsis
+    --expect
+    --filepath-word
+    --fish
+    --header
+    --header-first
+    --header-lines
+    --height
+    --highlight-line
+    --history
+    --history-size
+    --hscroll-off
+    --info
+    --jump-labels
+    --keep-right
+    --layout
+    --listen
+    --listen-unsafe
+    --literal
+    --man
+    --margin
+    --marker
+    --min-height
+    --no-bold
+    --no-clear
+    --no-hscroll
+    --no-mouse
+    --no-scrollbar
+    --no-separator
+    --no-unicode
+    --padding
+    --pointer
+    --preview
     --preview-label
     --preview-label-pos
-    --no-unicode
-    --unicode
-    --margin
-    --padding
+    --preview-window
+    --print-query
+    --print0
+    --prompt
+    --read0
+    --reverse
+    --scheme
+    --scroll-off
+    --separator
+    --sync
     --tabstop
-    --listen
-    --no-listen
-    --clear
-    --no-clear
+    --tac
+    --tiebreak
+    --tmux
+    --track
     --version
+    --with-nth
+    --with-shell
+    --zsh
+    -0 --exit-0
+    -1 --select-1
+    -d --delimiter
+    -e --exact
+    -f --filter
+    -h --help
+    -i --ignore-case
+    -m --multi
+    -n --nth
+    -q --query
     --"
 
   case "${prev}" in
-  --algo)
-    COMPREPLY=( $(compgen -W "v1 v2" -- "$cur") )
-    return 0
-    ;;
   --scheme)
     COMPREPLY=( $(compgen -W "default path history" -- "$cur") )
     return 0
@@ -335,13 +302,19 @@ __fzf_generic_path_completion() {
         [[ -z "$dir" ]] && dir='.'
         [[ "$dir" != "/" ]] && dir="${dir/%\//}"
         matches=$(
-          unset FZF_DEFAULT_COMMAND
-          export FZF_DEFAULT_OPTS="--height ${FZF_TMUX_HEIGHT:-40%} --reverse --scheme=path --bind=ctrl-z:ignore ${FZF_DEFAULT_OPTS-} ${FZF_COMPLETION_OPTS-} $2"
+          export FZF_DEFAULT_OPTS=$(__fzf_defaults "--reverse --scheme=path" "${FZF_COMPLETION_OPTS-} $2")
+          unset FZF_DEFAULT_COMMAND FZF_DEFAULT_OPTS_FILE
           if declare -F "$1" > /dev/null; then
             eval "$1 $(printf %q "$dir")" | __fzf_comprun "$4" -q "$leftover"
           else
-            [[ $1 =~ dir ]] && walker=dir,follow || walker=file,dir,follow,hidden
-            __fzf_comprun "$4" -q "$leftover" --walker "$walker" --walker-root="$dir"
+            if [[ $1 =~ dir ]]; then
+              walker=dir,follow
+              rest=${FZF_COMPLETION_DIR_OPTS-}
+            else
+              walker=file,dir,follow,hidden
+              rest=${FZF_COMPLETION_PATH_OPTS-}
+            fi
+            __fzf_comprun "$4" -q "$leftover" --walker "$walker" --walker-root="$dir" $rest
           fi | while read -r item; do
             printf "%q " "${item%$3}$3"
           done
@@ -399,7 +372,10 @@ _fzf_complete() {
   if [[ "$cur" == *"$trigger" ]] && [[ $cur != *'$('* ]] && [[ $cur != *':='* ]] && [[ $cur != *'`'* ]]; then
     cur=${cur:0:${#cur}-${#trigger}}
 
-    selected=$(FZF_DEFAULT_OPTS="--height ${FZF_TMUX_HEIGHT:-40%} --reverse --bind=ctrl-z:ignore ${FZF_DEFAULT_OPTS-} ${FZF_COMPLETION_OPTS-} $str_arg" __fzf_comprun "${rest[0]}" "${args[@]}" -q "$cur" | $post | command tr '\n' ' ')
+    selected=$(
+      FZF_DEFAULT_OPTS=$(__fzf_defaults "--reverse" "${FZF_COMPLETION_OPTS-} $str_arg") \
+      FZF_DEFAULT_OPTS_FILE='' \
+        __fzf_comprun "${rest[0]}" "${args[@]}" -q "$cur" | $post | command tr '\n' ' ')
     selected=${selected% } # Strip trailing space not to repeat "-o nospace"
     if [[ -n "$selected" ]]; then
       COMPREPLY=("$selected")
@@ -503,8 +479,11 @@ complete -o default -F _fzf_opts_completion fzf
 # fzf-tmux specific options (like `-w WIDTH`) are left as a future patch.
 complete -o default -F _fzf_opts_completion fzf-tmux
 
-d_cmds="${FZF_COMPLETION_DIR_COMMANDS:-cd pushd rmdir}"
-a_cmds="
+d_cmds="${FZF_COMPLETION_DIR_COMMANDS-cd pushd rmdir}"
+
+# NOTE: $FZF_COMPLETION_PATH_COMMANDS and $FZF_COMPLETION_VAR_COMMANDS are
+# undocumented and subject to change in the future.
+a_cmds="${FZF_COMPLETION_PATH_COMMANDS-"
   awk bat cat diff diff3
   emacs emacsclient ex file ftp g++ gcc gvim head hg hx java
   javac ld less more mvim nvim patch perl python ruby
@@ -512,10 +491,11 @@ a_cmds="
   basename bunzip2 bzip2 chmod chown curl cp dirname du
   find git grep gunzip gzip hg jar
   ln ls mv open rm rsync scp
-  svn tar unzip zip"
+  svn tar unzip zip"}"
+v_cmds="${FZF_COMPLETION_VAR_COMMANDS-export unset printenv}"
 
 # Preserve existing completion
-__fzf_orig_completion < <(complete -p $d_cmds $a_cmds ssh 2> /dev/null)
+__fzf_orig_completion < <(complete -p $d_cmds $a_cmds $v_cmds unalias kill ssh 2> /dev/null)
 
 if type _comp_load > /dev/null 2>&1; then
   # _comp_load was added in bash-completion 2.12 to replace _completion_loader.
@@ -548,13 +528,24 @@ done
 
 # Directory
 for cmd in $d_cmds; do
-  __fzf_defc "$cmd" _fzf_dir_completion "-o nospace -o dirnames"
+  __fzf_defc "$cmd" _fzf_dir_completion "-o bashdefault -o nospace -o dirnames"
 done
+
+# Variables
+for cmd in $v_cmds; do
+  __fzf_defc "$cmd" _fzf_var_completion "-o default -o nospace -v"
+done
+
+# Aliases
+__fzf_defc unalias _fzf_alias_completion "-a"
+
+# Processes
+__fzf_defc kill _fzf_proc_completion "-o default -o bashdefault"
 
 # ssh
 __fzf_defc ssh _fzf_complete_ssh "-o default -o bashdefault"
 
-unset cmd d_cmds a_cmds
+unset cmd d_cmds a_cmds v_cmds
 
 _fzf_setup_completion() {
   local kind fn cmd
@@ -576,8 +567,4 @@ _fzf_setup_completion() {
   done
 }
 
-# Environment variables / Aliases / Hosts / Process
-_fzf_setup_completion 'var'   export unset printenv
-_fzf_setup_completion 'alias' unalias
-_fzf_setup_completion 'host'  telnet
-_fzf_setup_completion 'proc'  kill
+fi

@@ -11,8 +11,6 @@
 # - $FZF_ALT_C_COMMAND
 # - $FZF_ALT_C_OPTS
 
-[[ -o interactive ]] || return 0
-
 
 # Key bindings
 # ------------
@@ -38,12 +36,23 @@ fi
 'builtin' 'emulate' 'zsh' && 'builtin' 'setopt' 'no_aliases'
 
 {
+if [[ -o interactive ]]; then
+
+__fzf_defaults() {
+  # $1: Prepend to FZF_DEFAULT_OPTS_FILE and FZF_DEFAULT_OPTS
+  # $2: Append to FZF_DEFAULT_OPTS_FILE and FZF_DEFAULT_OPTS
+  echo "--height ${FZF_TMUX_HEIGHT:-40%} --bind=ctrl-z:ignore $1"
+  command cat "${FZF_DEFAULT_OPTS_FILE-}" 2> /dev/null
+  echo "${FZF_DEFAULT_OPTS-} $2"
+}
 
 # CTRL-T - Paste the selected file path(s) into the command line
-__fsel() {
+__fzf_select() {
   setopt localoptions pipefail no_aliases 2> /dev/null
   local item
-  FZF_DEFAULT_COMMAND=${FZF_CTRL_T_COMMAND:-} FZF_DEFAULT_OPTS="--height ${FZF_TMUX_HEIGHT:-40%} --reverse --walker=file,dir,follow,hidden --scheme=path --bind=ctrl-z:ignore ${FZF_DEFAULT_OPTS-} ${FZF_CTRL_T_OPTS-}" $(__fzfcmd) -m "$@" < /dev/tty | while read item; do
+  FZF_DEFAULT_COMMAND=${FZF_CTRL_T_COMMAND:-} \
+  FZF_DEFAULT_OPTS=$(__fzf_defaults "--reverse --walker=file,dir,follow,hidden --scheme=path" "${FZF_CTRL_T_OPTS-} -m") \
+  FZF_DEFAULT_OPTS_FILE='' $(__fzfcmd) "$@" < /dev/tty | while read item; do
     echo -n "${(q)item} "
   done
   local ret=$?
@@ -57,7 +66,7 @@ __fzfcmd() {
 }
 
 fzf-file-widget() {
-  LBUFFER="${LBUFFER}$(__fsel)"
+  LBUFFER="${LBUFFER}$(__fzf_select)"
   local ret=$?
   zle reset-prompt
   return $ret
@@ -72,7 +81,10 @@ fi
 # ALT-C - cd into the selected directory
 fzf-cd-widget() {
   setopt localoptions pipefail no_aliases 2> /dev/null
-  local dir="$(FZF_DEFAULT_COMMAND=${FZF_ALT_C_COMMAND:-} FZF_DEFAULT_OPTS="--height ${FZF_TMUX_HEIGHT:-40%} --reverse --walker=dir,follow,hidden --scheme=path --bind=ctrl-z:ignore ${FZF_DEFAULT_OPTS-} ${FZF_ALT_C_OPTS-}" $(__fzfcmd) +m < /dev/tty)"
+  local dir="$(
+    FZF_DEFAULT_COMMAND=${FZF_ALT_C_COMMAND:-} \
+    FZF_DEFAULT_OPTS=$(__fzf_defaults "--reverse --walker=dir,follow,hidden --scheme=path" "${FZF_ALT_C_OPTS-} +m") \
+    FZF_DEFAULT_OPTS_FILE='' $(__fzfcmd) < /dev/tty)"
   if [[ -z "$dir" ]]; then
     zle redisplay
     return 0
@@ -96,13 +108,22 @@ fi
 fzf-history-widget() {
   local selected num
   setopt localoptions noglobsubst noposixbuiltins pipefail no_aliases 2> /dev/null
-  selected="$(fc -rl 1 | awk '{ cmd=$0; sub(/^[ \t]*[0-9]+\**[ \t]+/, "", cmd); if (!seen[cmd]++) print $0 }' |
-    FZF_DEFAULT_OPTS="--height ${FZF_TMUX_HEIGHT:-40%} ${FZF_DEFAULT_OPTS-} -n2..,.. --scheme=history --bind=ctrl-r:toggle-sort,ctrl-z:ignore ${FZF_CTRL_R_OPTS-} --query=${(qqq)LBUFFER} +m" $(__fzfcmd))"
+  # Ensure the associative history array, which maps event numbers to the full
+  # history lines, is loaded, and that Perl is installed for multi-line output.
+  if zmodload -F zsh/parameter p:history 2>/dev/null && (( ${#commands[perl]} )); then
+    selected="$(printf '%1$s\t%2$s\000' "${(vk)history[@]}" |
+      perl -0 -ne 'if (!$seen{(/^\s*[0-9]+\**\s+(.*)/, $1)}++) { s/\n/\n\t/gm; print; }' |
+      FZF_DEFAULT_OPTS=$(__fzf_defaults "" "-n2..,.. --scheme=history --bind=ctrl-r:toggle-sort --highlight-line ${FZF_CTRL_R_OPTS-} --query=${(qqq)LBUFFER} +m --read0") \
+      FZF_DEFAULT_OPTS_FILE='' $(__fzfcmd))"
+  else
+    selected="$(fc -rl 1 | awk '{ cmd=$0; sub(/^[ \t]*[0-9]+\**[ \t]+/, "", cmd); if (!seen[cmd]++) print $0 }' |
+      FZF_DEFAULT_OPTS=$(__fzf_defaults "" "-n2..,.. --scheme=history --bind=ctrl-r:toggle-sort --highlight-line ${FZF_CTRL_R_OPTS-} --query=${(qqq)LBUFFER} +m") \
+      FZF_DEFAULT_OPTS_FILE='' $(__fzfcmd))"
+  fi
   local ret=$?
   if [ -n "$selected" ]; then
-    num=$(awk '{print $1}' <<< "$selected")
-    if [[ "$num" =~ '^[1-9][0-9]*\*?$' ]]; then
-      zle vi-fetch-history -n ${num%\*}
+    if num=$(awk '{print $1; exit}' <<< "$selected" | grep -o '^[1-9][0-9]*'); then
+      zle vi-fetch-history -n $num
     else # selected is a custom query, not from history
       LBUFFER="$selected"
     fi
@@ -114,6 +135,7 @@ zle     -N            fzf-history-widget
 bindkey -M emacs '^R' fzf-history-widget
 bindkey -M vicmd '^R' fzf-history-widget
 bindkey -M viins '^R' fzf-history-widget
+fi
 
 } always {
   eval $__fzf_key_bindings_options

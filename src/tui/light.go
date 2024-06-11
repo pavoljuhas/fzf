@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/junegunn/fzf/src/util"
 	"github.com/rivo/uniseg"
 
 	"golang.org/x/term"
@@ -27,8 +29,8 @@ const (
 
 const consoleDevice string = "/dev/tty"
 
-var offsetRegexp *regexp.Regexp = regexp.MustCompile("(.*)\x1b\\[([0-9]+);([0-9]+)R")
-var offsetRegexpBegin *regexp.Regexp = regexp.MustCompile("^\x1b\\[[0-9]+;[0-9]+R")
+var offsetRegexp = regexp.MustCompile("(.*)\x1b\\[([0-9]+);([0-9]+)R")
+var offsetRegexpBegin = regexp.MustCompile("^\x1b\\[[0-9]+;[0-9]+R")
 
 func (r *LightRenderer) PassThrough(str string) {
 	r.queued.WriteString("\x1b7" + str + "\x1b8")
@@ -71,13 +73,14 @@ func (r *LightRenderer) csi(code string) string {
 
 func (r *LightRenderer) flush() {
 	if r.queued.Len() > 0 {
-		fmt.Fprint(os.Stderr, "\x1b[?25l"+r.queued.String()+"\x1b[?25h")
+		fmt.Fprint(r.ttyout, "\x1b[?7l\x1b[?25l"+r.queued.String()+"\x1b[?25h\x1b[?7h")
 		r.queued.Reset()
 	}
 }
 
 // Light renderer
 type LightRenderer struct {
+	closed        *util.AtomicBool
 	theme         *ColorTheme
 	mouse         bool
 	forceBlack    bool
@@ -85,6 +88,7 @@ type LightRenderer struct {
 	prevDownTime  time.Time
 	clicks        [][2]int
 	ttyin         *os.File
+	ttyout        *os.File
 	buffer        []byte
 	origState     *term.State
 	width         int
@@ -123,19 +127,25 @@ type LightWindow struct {
 	bg       Color
 }
 
-func NewLightRenderer(theme *ColorTheme, forceBlack bool, mouse bool, tabstop int, clearOnExit bool, fullscreen bool, maxHeightFunc func(int) int) Renderer {
+func NewLightRenderer(ttyin *os.File, theme *ColorTheme, forceBlack bool, mouse bool, tabstop int, clearOnExit bool, fullscreen bool, maxHeightFunc func(int) int) (Renderer, error) {
+	out, err := openTtyOut()
+	if err != nil {
+		out = os.Stderr
+	}
 	r := LightRenderer{
+		closed:        util.NewAtomicBool(false),
 		theme:         theme,
 		forceBlack:    forceBlack,
 		mouse:         mouse,
 		clearOnExit:   clearOnExit,
-		ttyin:         openTtyIn(),
+		ttyin:         ttyin,
+		ttyout:        out,
 		yoffset:       0,
 		tabstop:       tabstop,
 		fullscreen:    fullscreen,
 		upOneLine:     false,
 		maxHeightFunc: maxHeightFunc}
-	return &r
+	return &r, nil
 }
 
 func repeat(r rune, times int) string {
@@ -153,11 +163,11 @@ func atoi(s string, defaultValue int) int {
 	return value
 }
 
-func (r *LightRenderer) Init() {
+func (r *LightRenderer) Init() error {
 	r.escDelay = atoi(os.Getenv("ESCDELAY"), defaultEscDelay)
 
 	if err := r.initPlatform(); err != nil {
-		errorExit(err.Error())
+		return err
 	}
 	r.updateTerminalSize()
 	initTheme(r.theme, r.defaultTheme(), r.forceBlack)
@@ -195,6 +205,7 @@ func (r *LightRenderer) Init() {
 	if !r.fullscreen && r.mouse {
 		r.yoffset, _ = r.findOffset()
 	}
+	return nil
 }
 
 func (r *LightRenderer) Resize(maxHeightFunc func(int) int) {
@@ -233,19 +244,20 @@ func getEnv(name string, defaultValue int) int {
 	return atoi(env, defaultValue)
 }
 
-func (r *LightRenderer) getBytes() []byte {
-	return r.getBytesInternal(r.buffer, false)
+func (r *LightRenderer) getBytes() ([]byte, error) {
+	bytes, err := r.getBytesInternal(r.buffer, false)
+	return bytes, err
 }
 
-func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) []byte {
+func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) ([]byte, error) {
 	c, ok := r.getch(nonblock)
 	if !nonblock && !ok {
 		r.Close()
-		errorExit("Failed to read " + consoleDevice)
+		return nil, errors.New("failed to read " + consoleDevice)
 	}
 
 	retries := 0
-	if c == ESC.Int() || nonblock {
+	if c == Esc.Int() || nonblock {
 		retries = r.escDelay / escPollInterval
 	}
 	buffer = append(buffer, byte(c))
@@ -260,7 +272,7 @@ func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) []byte {
 				continue
 			}
 			break
-		} else if c == ESC.Int() && pc != c {
+		} else if c == Esc.Int() && pc != c {
 			retries = r.escDelay / escPollInterval
 		} else {
 			retries = 0
@@ -272,19 +284,23 @@ func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) []byte {
 		// so terminate fzf immediately.
 		if len(buffer) > maxInputBuffer {
 			r.Close()
-			panic(fmt.Sprintf("Input buffer overflow (%d): %v", len(buffer), buffer))
+			return nil, fmt.Errorf("input buffer overflow (%d): %v", len(buffer), buffer)
 		}
 	}
 
-	return buffer
+	return buffer, nil
 }
 
 func (r *LightRenderer) GetChar() Event {
+	var err error
 	if len(r.buffer) == 0 {
-		r.buffer = r.getBytes()
+		r.buffer, err = r.getBytes()
+		if err != nil {
+			return Event{Fatal, 0, nil}
+		}
 	}
 	if len(r.buffer) == 0 {
-		panic("Empty buffer")
+		return Event{Fatal, 0, nil}
 	}
 
 	sz := 1
@@ -300,7 +316,7 @@ func (r *LightRenderer) GetChar() Event {
 	case CtrlQ.Byte():
 		return Event{CtrlQ, 0, nil}
 	case 127:
-		return Event{BSpace, 0, nil}
+		return Event{Backspace, 0, nil}
 	case 0:
 		return Event{CtrlSpace, 0, nil}
 	case 28:
@@ -311,11 +327,13 @@ func (r *LightRenderer) GetChar() Event {
 		return Event{CtrlCaret, 0, nil}
 	case 31:
 		return Event{CtrlSlash, 0, nil}
-	case ESC.Byte():
+	case Esc.Byte():
 		ev := r.escSequence(&sz)
 		// Second chance
 		if ev.Type == Invalid {
-			r.buffer = r.getBytes()
+			if r.buffer, err = r.getBytes(); err != nil {
+				return Event{Fatal, 0, nil}
+			}
 			ev = r.escSequence(&sz)
 		}
 		return ev
@@ -327,7 +345,7 @@ func (r *LightRenderer) GetChar() Event {
 	}
 	char, rsz := utf8.DecodeRune(r.buffer)
 	if char == utf8.RuneError {
-		return Event{ESC, 0, nil}
+		return Event{Esc, 0, nil}
 	}
 	sz = rsz
 	return Event{Rune, char, nil}
@@ -335,7 +353,7 @@ func (r *LightRenderer) GetChar() Event {
 
 func (r *LightRenderer) escSequence(sz *int) Event {
 	if len(r.buffer) < 2 {
-		return Event{ESC, 0, nil}
+		return Event{Esc, 0, nil}
 	}
 
 	loc := offsetRegexpBegin.FindIndex(r.buffer)
@@ -349,15 +367,15 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 		return CtrlAltKey(rune(r.buffer[1] + 'a' - 1))
 	}
 	alt := false
-	if len(r.buffer) > 2 && r.buffer[1] == ESC.Byte() {
+	if len(r.buffer) > 2 && r.buffer[1] == Esc.Byte() {
 		r.buffer = r.buffer[1:]
 		alt = true
 	}
 	switch r.buffer[1] {
-	case ESC.Byte():
-		return Event{ESC, 0, nil}
+	case Esc.Byte():
+		return Event{Esc, 0, nil}
 	case 127:
-		return Event{AltBS, 0, nil}
+		return Event{AltBackspace, 0, nil}
 	case '[', 'O':
 		if len(r.buffer) < 3 {
 			return Event{Invalid, 0, nil}
@@ -386,7 +404,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 			}
 			return Event{Up, 0, nil}
 		case 'Z':
-			return Event{BTab, 0, nil}
+			return Event{ShiftTab, 0, nil}
 		case 'H':
 			return Event{Home, 0, nil}
 		case 'F':
@@ -434,7 +452,7 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 				return Event{Invalid, 0, nil} // INS
 			case '3':
 				if r.buffer[3] == '~' {
-					return Event{Del, 0, nil}
+					return Event{Delete, 0, nil}
 				}
 				if len(r.buffer) == 6 && r.buffer[5] == '~' {
 					*sz = 6
@@ -442,16 +460,16 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 					case '5':
 						return Event{CtrlDelete, 0, nil}
 					case '2':
-						return Event{SDelete, 0, nil}
+						return Event{ShiftDelete, 0, nil}
 					}
 				}
 				return Event{Invalid, 0, nil}
 			case '4':
 				return Event{End, 0, nil}
 			case '5':
-				return Event{PgUp, 0, nil}
+				return Event{PageUp, 0, nil}
 			case '6':
-				return Event{PgDn, 0, nil}
+				return Event{PageDown, 0, nil}
 			case '7':
 				return Event{Home, 0, nil}
 			case '8':
@@ -489,16 +507,29 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 					}
 					*sz = 6
 					switch r.buffer[4] {
-					case '1', '2', '3', '5':
+					case '1', '2', '3', '4', '5':
+						//                   Kitty      iTerm2     WezTerm
+						// SHIFT-ARROW       "\e[1;2D"
+						// ALT-SHIFT-ARROW   "\e[1;4D"  "\e[1;10D" "\e[1;4D"
+						// CTRL-SHIFT-ARROW  "\e[1;6D"             N/A
+						// CMD-SHIFT-ARROW   "\e[1;10D" N/A        N/A ("\e[1;2D")
 						alt := r.buffer[4] == '3'
-						altShift := r.buffer[4] == '1' && r.buffer[5] == '0'
 						char := r.buffer[5]
-						if altShift {
+						altShift := false
+						if r.buffer[4] == '1' && r.buffer[5] == '0' {
+							altShift = true
 							if len(r.buffer) < 7 {
 								return Event{Invalid, 0, nil}
 							}
 							*sz = 7
 							char = r.buffer[6]
+						} else if r.buffer[4] == '4' {
+							altShift = true
+							if len(r.buffer) < 6 {
+								return Event{Invalid, 0, nil}
+							}
+							*sz = 6
+							char = r.buffer[5]
 						}
 						switch char {
 						case 'A':
@@ -506,33 +537,33 @@ func (r *LightRenderer) escSequence(sz *int) Event {
 								return Event{AltUp, 0, nil}
 							}
 							if altShift {
-								return Event{AltSUp, 0, nil}
+								return Event{AltShiftUp, 0, nil}
 							}
-							return Event{SUp, 0, nil}
+							return Event{ShiftUp, 0, nil}
 						case 'B':
 							if alt {
 								return Event{AltDown, 0, nil}
 							}
 							if altShift {
-								return Event{AltSDown, 0, nil}
+								return Event{AltShiftDown, 0, nil}
 							}
-							return Event{SDown, 0, nil}
+							return Event{ShiftDown, 0, nil}
 						case 'C':
 							if alt {
 								return Event{AltRight, 0, nil}
 							}
 							if altShift {
-								return Event{AltSRight, 0, nil}
+								return Event{AltShiftRight, 0, nil}
 							}
-							return Event{SRight, 0, nil}
+							return Event{ShiftRight, 0, nil}
 						case 'D':
 							if alt {
 								return Event{AltLeft, 0, nil}
 							}
 							if altShift {
-								return Event{AltSLeft, 0, nil}
+								return Event{AltShiftLeft, 0, nil}
 							}
-							return Event{SLeft, 0, nil}
+							return Event{ShiftLeft, 0, nil}
 						}
 					} // r.buffer[4]
 				} // r.buffer[3]
@@ -725,6 +756,7 @@ func (r *LightRenderer) Close() {
 	r.flush()
 	r.closePlatform()
 	r.restoreTerminal()
+	r.closed.Set(true)
 }
 
 func (r *LightRenderer) Top() int {
@@ -808,44 +840,32 @@ func (w *LightWindow) drawBorderHorizontal(top, bottom bool) {
 		color = ColPreviewBorder
 	}
 	hw := runeWidth(w.border.top)
-	pad := repeat(' ', w.width/hw)
-
-	w.Move(0, 0)
 	if top {
+		w.Move(0, 0)
 		w.CPrint(color, repeat(w.border.top, w.width/hw))
-	} else {
-		w.CPrint(color, pad)
 	}
 
-	for y := 1; y < w.height-1; y++ {
-		w.Move(y, 0)
-		w.CPrint(color, pad)
-	}
-
-	w.Move(w.height-1, 0)
 	if bottom {
+		w.Move(w.height-1, 0)
 		w.CPrint(color, repeat(w.border.bottom, w.width/hw))
-	} else {
-		w.CPrint(color, pad)
 	}
 }
 
 func (w *LightWindow) drawBorderVertical(left, right bool) {
-	width := w.width - 2
-	if !left || !right {
-		width++
-	}
+	vw := runeWidth(w.border.left)
 	color := ColBorder
 	if w.preview {
 		color = ColPreviewBorder
 	}
 	for y := 0; y < w.height; y++ {
-		w.Move(y, 0)
 		if left {
+			w.Move(y, 0)
 			w.CPrint(color, string(w.border.left))
+			w.CPrint(color, " ") // Margin
 		}
-		w.CPrint(color, repeat(' ', width))
 		if right {
+			w.Move(y, w.width-vw-1)
+			w.CPrint(color, " ") // Margin
 			w.CPrint(color, string(w.border.right))
 		}
 	}
@@ -867,7 +887,10 @@ func (w *LightWindow) drawBorderAround(onlyHorizontal bool) {
 		for y := 1; y < w.height-1; y++ {
 			w.Move(y, 0)
 			w.CPrint(color, string(w.border.left))
-			w.CPrint(color, repeat(' ', w.width-vw*2))
+			w.CPrint(color, " ") // Margin
+
+			w.Move(y, w.width-vw-1)
+			w.CPrint(color, " ") // Margin
 			w.CPrint(color, string(w.border.right))
 		}
 	}
@@ -998,7 +1021,7 @@ func (w *LightWindow) Print(text string) {
 }
 
 func cleanse(str string) string {
-	return strings.Replace(str, "\x1b", "", -1)
+	return strings.ReplaceAll(str, "\x1b", "")
 }
 
 func (w *LightWindow) CPrint(pair ColorPair, text string) {

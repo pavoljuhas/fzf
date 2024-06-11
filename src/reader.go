@@ -18,20 +18,22 @@ import (
 // Reader reads from command or standard input
 type Reader struct {
 	pusher   func([]byte) bool
+	executor *util.Executor
 	eventBox *util.EventBox
 	delimNil bool
 	event    int32
 	finChan  chan bool
 	mutex    sync.Mutex
 	exec     *exec.Cmd
+	execOut  io.ReadCloser
 	command  *string
 	killed   bool
 	wait     bool
 }
 
 // NewReader returns new Reader object
-func NewReader(pusher func([]byte) bool, eventBox *util.EventBox, delimNil bool, wait bool) *Reader {
-	return &Reader{pusher, eventBox, delimNil, int32(EvtReady), make(chan bool, 1), sync.Mutex{}, nil, nil, false, wait}
+func NewReader(pusher func([]byte) bool, eventBox *util.EventBox, executor *util.Executor, delimNil bool, wait bool) *Reader {
+	return &Reader{pusher, executor, eventBox, delimNil, int32(EvtReady), make(chan bool, 1), sync.Mutex{}, nil, nil, nil, false, wait}
 }
 
 func (r *Reader) startEventPoller() {
@@ -78,6 +80,7 @@ func (r *Reader) terminate() {
 	r.mutex.Lock()
 	r.killed = true
 	if r.exec != nil && r.exec.Process != nil {
+		r.execOut.Close()
 		util.KillCommand(r.exec)
 	} else {
 		os.Stdin.Close()
@@ -85,18 +88,34 @@ func (r *Reader) terminate() {
 	r.mutex.Unlock()
 }
 
-func (r *Reader) restart(command string, environ []string) {
+func (r *Reader) restart(command commandSpec, environ []string) {
 	r.event = int32(EvtReady)
 	r.startEventPoller()
-	success := r.readFromCommand(command, environ)
+	success := r.readFromCommand(command.command, environ)
 	r.fin(success)
+	removeFiles(command.tempFiles)
+}
+
+func (r *Reader) readChannel(inputChan chan string) bool {
+	for {
+		item, more := <-inputChan
+		if !more {
+			break
+		}
+		if r.pusher([]byte(item)) {
+			atomic.StoreInt32(&r.event, int32(EvtReadNew))
+		}
+	}
+	return true
 }
 
 // ReadSource reads data from the default command or from standard input
-func (r *Reader) ReadSource(root string, opts walkerOpts, ignores []string) {
+func (r *Reader) ReadSource(inputChan chan string, root string, opts walkerOpts, ignores []string) {
 	r.startEventPoller()
 	var success bool
-	if util.IsTty() {
+	if inputChan != nil {
+		success = r.readChannel(inputChan)
+	} else if util.IsTty(os.Stdin) {
 		cmd := os.Getenv("FZF_DEFAULT_COMMAND")
 		if len(cmd) == 0 {
 			success = r.readFiles(root, opts, ignores)
@@ -127,8 +146,10 @@ func (r *Reader) feed(src io.Reader) {
 	*/
 
 	delim := byte('\n')
+	trimCR := util.IsWindows()
 	if r.delimNil {
 		delim = '\000'
+		trimCR = false
 	}
 
 	slab := make([]byte, readerSlabSize)
@@ -145,7 +166,7 @@ func (r *Reader) feed(src io.Reader) {
 		}
 
 		// We're not making any progress after 100 tries. Stop.
-		if n == 0 && err == nil {
+		if n == 0 {
 			break
 		}
 
@@ -157,7 +178,7 @@ func (r *Reader) feed(src io.Reader) {
 				// Found the delimiter
 				slice := buf[:i+1]
 				buf = buf[i+1:]
-				if util.IsWindows() && len(slice) >= 2 && slice[len(slice)-2] == byte('\r') {
+				if trimCR && len(slice) >= 2 && slice[len(slice)-2] == byte('\r') {
 					slice = slice[:len(slice)-2]
 				} else {
 					slice = slice[:len(slice)-1]
@@ -171,6 +192,12 @@ func (r *Reader) feed(src io.Reader) {
 				}
 			} else {
 				// Could not find the delimiter in the buffer
+				//   NOTE: We can further optimize this by keeping track of the cursor
+				//   position in the slab so that a straddling item that doesn't go
+				//   beyond the boundary of a slab doesn't need to be copied to
+				//   another buffer. However, the performance gain is negligible in
+				//   practice (< 0.1%) and is not
+				//   worth the added complexity.
 				leftover = append(leftover, buf...)
 				break
 			}
@@ -234,20 +261,27 @@ func (r *Reader) readFromCommand(command string, environ []string) bool {
 	r.mutex.Lock()
 	r.killed = false
 	r.command = &command
-	r.exec = util.ExecCommand(command, true)
+	r.exec = r.executor.ExecCommand(command, true)
 	if environ != nil {
 		r.exec.Env = environ
 	}
-	out, err := r.exec.StdoutPipe()
+
+	var err error
+	r.execOut, err = r.exec.StdoutPipe()
 	if err != nil {
+		r.exec = nil
 		r.mutex.Unlock()
 		return false
 	}
+
 	err = r.exec.Start()
-	r.mutex.Unlock()
 	if err != nil {
+		r.exec = nil
+		r.mutex.Unlock()
 		return false
 	}
-	r.feed(out)
+
+	r.mutex.Unlock()
+	r.feed(r.execOut)
 	return r.exec.Wait() == nil
 }

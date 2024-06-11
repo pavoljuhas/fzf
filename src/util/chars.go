@@ -1,6 +1,7 @@
 package util
 
 import (
+	"bytes"
 	"fmt"
 	"unicode"
 	"unicode/utf8"
@@ -72,6 +73,35 @@ func (chars *Chars) IsBytes() bool {
 
 func (chars *Chars) Bytes() []byte {
 	return chars.slice
+}
+
+func (chars *Chars) NumLines(atMost int) (int, bool) {
+	lines := 1
+	if runes := chars.optionalRunes(); runes != nil {
+		for _, r := range runes {
+			if r == '\n' {
+				lines++
+			}
+			if lines > atMost {
+				return atMost, true
+			}
+		}
+		return lines, false
+	}
+
+	for idx := 0; idx < len(chars.slice); idx++ {
+		found := bytes.IndexByte(chars.slice[idx:], '\n')
+		if found < 0 {
+			break
+		}
+
+		idx += found
+		lines++
+		if lines > atMost {
+			return atMost, true
+		}
+	}
+	return lines, false
 }
 
 func (chars *Chars) optionalRunes() []rune {
@@ -163,7 +193,7 @@ func (chars *Chars) ToString() string {
 	if runes := chars.optionalRunes(); runes != nil {
 		return string(runes)
 	}
-	return string(chars.slice)
+	return unsafe.String(unsafe.SliceData(chars.slice), len(chars.slice))
 }
 
 func (chars *Chars) ToRunes() []rune {
@@ -178,12 +208,12 @@ func (chars *Chars) ToRunes() []rune {
 	return runes
 }
 
-func (chars *Chars) CopyRunes(dest []rune) {
+func (chars *Chars) CopyRunes(dest []rune, from int) {
 	if runes := chars.optionalRunes(); runes != nil {
-		copy(dest, runes)
+		copy(dest, runes[from:])
 		return
 	}
-	for idx, b := range chars.slice[:len(dest)] {
+	for idx, b := range chars.slice[from:][:len(dest)] {
 		dest[idx] = rune(b)
 	}
 }
