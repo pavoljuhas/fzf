@@ -11,7 +11,7 @@ import (
 	"github.com/junegunn/fzf/src/protector"
 )
 
-var version = "0.53"
+var version = "0.62"
 var revision = "devel"
 
 //go:embed shell/key-bindings.bash
@@ -39,7 +39,7 @@ func printScript(label string, content []byte) {
 }
 
 func exit(code int, err error) {
-	if code == fzf.ExitError {
+	if code == fzf.ExitError && err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 	}
 	os.Exit(code)

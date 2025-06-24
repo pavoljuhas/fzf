@@ -97,24 +97,12 @@ func Min32(first int32, second int32) int32 {
 
 // Constrain32 limits the given 32-bit integer with the upper and lower bounds
 func Constrain32(val int32, min int32, max int32) int32 {
-	if val < min {
-		return min
-	}
-	if val > max {
-		return max
-	}
-	return val
+	return Max32(Min32(val, max), min)
 }
 
 // Constrain limits the given integer with the upper and lower bounds
 func Constrain(val int, min int, max int) int {
-	if val < min {
-		return min
-	}
-	if val > max {
-		return max
-	}
-	return val
+	return Max(Min(val, max), min)
 }
 
 func AsUint16(val int) uint16 {
@@ -144,12 +132,22 @@ func IsTty(file *os.File) bool {
 	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 }
 
+// RunOnce runs the given function only once
+func RunOnce(f func()) func() {
+	once := Once(true)
+	return func() {
+		if once() {
+			f()
+		}
+	}
+}
+
 // Once returns a function that returns the specified boolean value only once
 func Once(nextResponse bool) func() bool {
 	state := nextResponse
 	return func() bool {
 		prevState := state
-		state = false
+		state = !nextResponse
 		return prevState
 	}
 }
