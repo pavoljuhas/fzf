@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"os"
@@ -179,6 +180,7 @@ type itemLine struct {
 	result    Result
 	empty     bool
 	other     bool
+	hidden    bool
 }
 
 func (t *Terminal) inListWindow() bool {
@@ -272,9 +274,12 @@ type Terminal struct {
 	footerLabel        labelPrinter
 	footerLabelLen     int
 	footerLabelOpts    labelOpts
+	gutterReverse      bool
+	gutterRawReverse   bool
 	pointer            string
 	pointerLen         int
 	pointerEmpty       string
+	pointerEmptyRaw    string
 	marker             string
 	markerLen          int
 	markerEmpty        string
@@ -291,6 +296,8 @@ type Terminal struct {
 	gapLineLen         int
 	wordRubout         string
 	wordNext           string
+	subWordRubout      string
+	subWordNext        string
 	cx                 int
 	cy                 int
 	offset             int
@@ -324,6 +331,8 @@ type Terminal struct {
 	scrollbar          string
 	previewScrollbar   string
 	ansi               bool
+	freezeLeft         int
+	freezeRight        int
 	nthAttr            tui.Attr
 	nth                []Range
 	nthCurrent         []Range
@@ -379,6 +388,9 @@ type Terminal struct {
 	printer            func(string)
 	printsep           string
 	merger             *Merger
+	passMerger         *Merger
+	resultMerger       *Merger
+	matchMap           map[int32]Result
 	selected           map[int32]selectedItem
 	version            int64
 	revision           revision
@@ -397,7 +409,6 @@ type Terminal struct {
 	initFunc           func() error
 	prevLines          []itemLine
 	suppress           bool
-	sigstop            bool
 	startChan          chan fitpad
 	killChan           chan bool
 	serverInputChan    chan []*action
@@ -426,6 +437,7 @@ type Terminal struct {
 	clickFooterColumn  int
 	proxyScript        string
 	numLinesCache      map[int32]numLinesCacheValue
+	raw                bool
 }
 
 type numLinesCacheValue struct {
@@ -486,6 +498,14 @@ const (
 	reqFatal
 )
 
+func isTerminalEvent(et util.EventType) bool {
+	switch et {
+	case reqClose, reqPrintQuery, reqBecome, reqQuit, reqFatal:
+		return true
+	}
+	return false
+}
+
 type action struct {
 	t actionType
 	a string
@@ -512,6 +532,7 @@ const (
 	actBackwardDeleteChar
 	actBackwardDeleteCharEof
 	actBackwardWord
+	actBackwardSubWord
 	actCancel
 
 	actChangeBorderLabel
@@ -541,12 +562,15 @@ const (
 	actFatal
 	actForwardChar
 	actForwardWord
+	actForwardSubWord
 	actKillLine
 	actKillWord
+	actKillSubWord
 	actUnixLineDiscard
 	actUnixWordRubout
 	actYank
 	actBackwardKillWord
+	actBackwardKillSubWord
 	actSelectAll
 	actDeselectAll
 	actToggle
@@ -562,13 +586,18 @@ const (
 	actToggleWrap
 	actToggleMultiLine
 	actToggleHscroll
+	actToggleRaw
+	actEnableRaw
+	actDisableRaw
 	actTrackCurrent
 	actToggleInput
 	actHideInput
 	actShowInput
 	actUntrackCurrent
 	actDown
+	actDownMatch
 	actUp
+	actUpMatch
 	actPageUp
 	actPageDown
 	actPosition
@@ -644,6 +673,7 @@ const (
 	actExecuteSilent
 	actExecuteMulti // Deprecated
 	actSigStop
+	actBest
 	actFirst
 	actLast
 	actReload
@@ -780,16 +810,18 @@ func defaultKeymap() map[tui.Event][]*action {
 	add(tui.CtrlD, actDeleteCharEof)
 	add(tui.CtrlE, actEndOfLine)
 	add(tui.CtrlF, actForwardChar)
-	add(tui.CtrlH, actBackwardDeleteChar)
 	add(tui.Backspace, actBackwardDeleteChar)
+	add(tui.CtrlBackspace, actBackwardDeleteChar)
 	add(tui.Tab, actToggleDown)
 	add(tui.ShiftTab, actToggleUp)
 	add(tui.CtrlJ, actDown)
 	add(tui.CtrlK, actUp)
 	add(tui.CtrlL, actClearScreen)
 	add(tui.Enter, actAccept)
-	add(tui.CtrlN, actDown)
-	add(tui.CtrlP, actUp)
+	add(tui.CtrlN, actDownMatch)
+	add(tui.CtrlP, actUpMatch)
+	add(tui.AltDown, actDownMatch)
+	add(tui.AltUp, actUpMatch)
 	add(tui.CtrlU, actUnixLineDiscard)
 	add(tui.CtrlW, actUnixWordRubout)
 	add(tui.CtrlY, actYank)
@@ -936,16 +968,16 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 	}
 	wordRubout := "[^\\pL\\pN][\\pL\\pN]"
 	wordNext := "[\\pL\\pN][^\\pL\\pN]|(.$)"
+	subWordRubout := "[a-z][A-Z]|[^\\pL\\pN][\\pL\\pN]"
+	subWordNext := "[a-z][A-Z]|[\\pL\\pN][^\\pL\\pN]|(.$)"
 	if opts.FileWord {
 		sep := regexp.QuoteMeta(string(os.PathSeparator))
 		wordRubout = fmt.Sprintf("%s[^%s]", sep, sep)
 		wordNext = fmt.Sprintf("[^%s]%s|(.$)", sep, sep)
 	}
-	keymapCopy := make(map[tui.Event][]*action)
-	for key, action := range opts.Keymap {
-		keymapCopy[key] = action
-	}
+	keymapCopy := maps.Clone(opts.Keymap)
 
+	em := EmptyMerger(revision{})
 	t := Terminal{
 		initDelay:          delay,
 		infoCommand:        opts.InfoCommand,
@@ -969,6 +1001,8 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 		markerMultiLine:    *opts.MarkerMulti,
 		wordRubout:         wordRubout,
 		wordNext:           wordNext,
+		subWordRubout:      subWordRubout,
+		subWordNext:        subWordNext,
 		cx:                 len(input),
 		cy:                 0,
 		offset:             0,
@@ -1026,10 +1060,13 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 		footer:             opts.Footer,
 		header0:            opts.Header,
 		ansi:               opts.Ansi,
+		freezeLeft:         opts.FreezeLeft,
+		freezeRight:        opts.FreezeRight,
 		nthAttr:            opts.Theme.Nth.Attr,
 		nth:                opts.Nth,
 		nthCurrent:         opts.Nth,
 		tabstop:            opts.Tabstop,
+		raw:                opts.Raw,
 		hasStartActions:    false,
 		hasResultActions:   false,
 		hasFocusActions:    false,
@@ -1043,7 +1080,10 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 		printer:            opts.Printer,
 		printsep:           opts.PrintSep,
 		proxyScript:        opts.ProxyScript,
-		merger:             EmptyMerger(revision{}),
+		merger:             em,
+		passMerger:         em,
+		resultMerger:       em,
+		matchMap:           make(map[int32]Result),
 		selected:           make(map[int32]selectedItem),
 		runningCmds:        util.NewConcurrentSet[*runningCmd](),
 		reqBox:             util.NewEventBox(),
@@ -1080,13 +1120,45 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 		t.acceptNth = opts.AcceptNth(t.delimiter)
 	}
 
+	baseTheme := opts.BaseTheme
+	if baseTheme == nil {
+		baseTheme = renderer.DefaultTheme()
+	}
 	// This should be called before accessing tui.Color*
-	tui.InitTheme(opts.Theme, renderer.DefaultTheme(), opts.Black, opts.InputBorderShape.Visible(), opts.HeaderBorderShape.Visible())
+	tui.InitTheme(opts.Theme, baseTheme, opts.Bold, opts.Black, opts.InputBorderShape.Visible(), opts.HeaderBorderShape.Visible())
+
+	// Gutter character
+	var gutterChar, gutterRawChar string
+	if opts.Gutter != nil {
+		gutterChar = *opts.Gutter
+	} else if t.unicode {
+		gutterChar = "▌"
+	} else {
+		gutterChar = " "
+		t.gutterReverse = true
+	}
+
+	if opts.GutterRaw != nil {
+		gutterRawChar = *opts.GutterRaw
+	} else if t.unicode {
+		gutterRawChar = "▖"
+	} else {
+		gutterRawChar = ":"
+		t.gutterRawReverse = false
+	}
 
 	t.prompt, t.promptLen = t.parsePrompt(opts.Prompt)
 	// Pre-calculated empty pointer and marker signs
-	t.pointerEmpty = strings.Repeat(" ", t.pointerLen)
+	if t.pointerLen == 0 {
+		t.pointerEmpty = ""
+		t.pointerEmptyRaw = ""
+	} else {
+		t.pointerEmpty = gutterChar + strings.Repeat(" ", util.Max(0, t.pointerLen-1))
+		t.pointerEmptyRaw = gutterRawChar + strings.Repeat(" ", util.Max(0, t.pointerLen-1))
+	}
 	t.markerEmpty = strings.Repeat(" ", t.markerLen)
+
+	// Labels
 	t.listLabel, t.listLabelLen = t.ansiLabelPrinter(opts.ListLabel.label, &tui.ColListLabel, false)
 	t.borderLabel, t.borderLabelLen = t.ansiLabelPrinter(opts.BorderLabel.label, &tui.ColBorderLabel, false)
 	t.previewLabel, t.previewLabelLen = t.ansiLabelPrinter(opts.PreviewLabel.label, &tui.ColPreviewLabel, false)
@@ -1207,7 +1279,9 @@ func NewTerminal(opts *Options, eventBox *util.EventBox, executor *util.Executor
 			return nil, err
 		}
 		t.listener = listener
-		t.listenPort = &port
+		if port > 0 {
+			t.listenPort = &port
+		}
 	}
 
 	if t.hasStartActions {
@@ -1231,6 +1305,9 @@ func (t *Terminal) environForPreview() []string {
 
 func (t *Terminal) environImpl(forPreview bool) []string {
 	env := os.Environ()
+	if t.listenAddr != nil && len(t.listenAddr.sock) > 0 {
+		env = append(env, "FZF_SOCK="+t.listenAddr.sock)
+	}
 	if t.listenPort != nil {
 		env = append(env, fmt.Sprintf("FZF_PORT=%d", *t.listenPort))
 	}
@@ -1245,8 +1322,20 @@ func (t *Terminal) environImpl(forPreview bool) []string {
 	env = append(env, "FZF_LIST_LABEL="+t.listLabelOpts.label)
 	env = append(env, "FZF_INPUT_LABEL="+t.inputLabelOpts.label)
 	env = append(env, "FZF_HEADER_LABEL="+t.headerLabelOpts.label)
+	direction := "down"
+	if t.layout == layoutDefault {
+		direction = "up"
+	}
+	env = append(env, "FZF_DIRECTION="+direction)
 	if len(t.nthCurrent) > 0 {
 		env = append(env, "FZF_NTH="+RangesToString(t.nthCurrent))
+	}
+	if t.raw {
+		val := "0"
+		if t.isCurrentItemMatch() {
+			val = "1"
+		}
+		env = append(env, "FZF_RAW="+val)
 	}
 	inputState := "enabled"
 	if t.inputless {
@@ -1256,7 +1345,7 @@ func (t *Terminal) environImpl(forPreview bool) []string {
 	}
 	env = append(env, "FZF_INPUT_STATE="+inputState)
 	env = append(env, fmt.Sprintf("FZF_TOTAL_COUNT=%d", t.count))
-	env = append(env, fmt.Sprintf("FZF_MATCH_COUNT=%d", t.merger.Length()))
+	env = append(env, fmt.Sprintf("FZF_MATCH_COUNT=%d", t.resultMerger.Length()))
 	env = append(env, fmt.Sprintf("FZF_SELECT_COUNT=%d", len(t.selected)))
 	env = append(env, fmt.Sprintf("FZF_LINES=%d", t.areaLines))
 	env = append(env, fmt.Sprintf("FZF_COLUMNS=%d", t.areaColumns))
@@ -1417,7 +1506,7 @@ func (t *Terminal) ansiLabelPrinter(str string, color *tui.ColorPair, fill bool)
 	printFn := func(window tui.Window, limit int) {
 		if offsets == nil {
 			// tui.Col* are not initialized until renderer.Init()
-			offsets = result.colorOffsets(nil, nil, t.theme, *color, *color, t.nthAttr)
+			offsets = result.colorOffsets(nil, nil, t.theme, *color, *color, t.nthAttr, false)
 		}
 		for limit > 0 {
 			if length > limit {
@@ -1480,7 +1569,7 @@ func (t *Terminal) parsePrompt(prompt string) (func(), int) {
 				return 1
 			}
 			t.printHighlighted(
-				Result{item: item}, tui.ColPrompt, tui.ColPrompt, false, false, line, line, true, preTask, nil)
+				Result{item: item}, tui.ColPrompt, tui.ColPrompt, false, false, false, line, line, true, preTask, nil)
 		})
 		t.wrap = wrap
 	}
@@ -1667,7 +1756,8 @@ func (t *Terminal) UpdateProgress(progress float32) {
 }
 
 // UpdateList updates Merger to display the list
-func (t *Terminal) UpdateList(merger *Merger) {
+func (t *Terminal) UpdateList(result MatchResult) {
+	merger := result.merger
 	t.mutex.Lock()
 	prevIndex := minItem.Index()
 	newRevision := merger.Revision()
@@ -1680,6 +1770,15 @@ func (t *Terminal) UpdateList(merger *Merger) {
 	}
 	t.progress = 100
 	t.merger = merger
+	t.resultMerger = merger
+	t.passMerger = result.passMerger
+	if t.raw {
+		t.merger = result.passMerger
+		t.matchMap = t.resultMerger.ToMap()
+	} else {
+		t.merger = result.merger
+		t.matchMap = make(map[int32]Result)
+	}
 	if t.revision != newRevision {
 		if !t.revision.compatible(newRevision) {
 			// Reloaded: clear selection
@@ -1728,7 +1827,7 @@ func (t *Terminal) UpdateList(merger *Merger) {
 	}
 	needActivation := false
 	if !t.reading {
-		switch t.merger.Length() {
+		switch t.resultMerger.Length() {
 		case 0:
 			zero := tui.Zero.AsEvent()
 			if _, prs := t.keymap[zero]; prs {
@@ -2371,6 +2470,13 @@ func (t *Terminal) resizeWindows(forcePreview bool, redrawBorder bool) {
 			innerHeight-shrink, tui.WindowList, noBorder, true)
 	}
 
+	if len(t.scrollbar) == 0 {
+		for y := 0; y < t.window.Height(); y++ {
+			t.window.Move(y, t.window.Width()-1)
+			t.window.Print(" ")
+		}
+	}
+
 	createInnerWindow := func(b tui.Window, shape tui.BorderShape, windowType tui.WindowType, shift int) tui.Window {
 		top := b.Top()
 		left := b.Left() + shift
@@ -2384,6 +2490,8 @@ func (t *Terminal) resizeWindows(forcePreview bool, redrawBorder bool) {
 		if shape.HasRight() {
 			width++
 		}
+		// Make sure that the width does not exceed the list width
+		width = util.Min(t.window.Width()+t.headerIndentImpl(0, shape), width)
 		height := b.Height() - borderLines(shape)
 		return t.tui.NewWindow(top, left, width, height, windowType, noBorder, true)
 	}
@@ -2768,7 +2876,7 @@ func (t *Terminal) printInfoImpl() {
 		return
 	}
 
-	found := t.merger.Length()
+	found := t.resultMerger.Length()
 	total := util.Max(found, t.count)
 	output := fmt.Sprintf("%d/%d", found, total)
 	if t.toggleSort {
@@ -2887,6 +2995,11 @@ func (t *Terminal) printInfoImpl() {
 	} else {
 		outputPrinter(t.window, maxWidth)
 	}
+	if t.infoStyle == infoInline && outputLen < maxWidth-1 && t.reading {
+		t.window.Print(" ")
+		printSpinner()
+		outputLen += 2
+	}
 
 	if t.infoStyle == infoInlineRight {
 		if t.separatorLen > 0 {
@@ -2985,7 +3098,7 @@ func (t *Terminal) printFooter() {
 				colors: colors}
 
 			t.printHighlighted(Result{item: item},
-				tui.ColFooter, tui.ColFooter, false, false, line, line, true,
+				tui.ColFooter, tui.ColFooter, false, false, false, line, line, true,
 				func(markerClass) int {
 					t.footerWindow.Print(indent)
 					return indentSize
@@ -2996,7 +3109,11 @@ func (t *Terminal) printFooter() {
 }
 
 func (t *Terminal) headerIndent(borderShape tui.BorderShape) int {
-	indentSize := t.pointerLen + t.markerLen
+	return t.headerIndentImpl(t.pointerLen+t.markerLen, borderShape)
+}
+
+func (t *Terminal) headerIndentImpl(base int, borderShape tui.BorderShape) int {
+	indentSize := base
 	if t.listBorderShape.HasLeft() {
 		indentSize += 1 + t.borderWidth
 	}
@@ -3057,7 +3174,7 @@ func (t *Terminal) printHeaderImpl(window tui.Window, borderShape tui.BorderShap
 			colors: colors}
 
 		t.printHighlighted(Result{item: item},
-			tui.ColHeader, tui.ColHeader, false, false, line, line, true,
+			tui.ColHeader, tui.ColHeader, false, false, false, line, line, true,
 			func(markerClass) int {
 				t.window.Print(indent)
 				return indentSize
@@ -3085,9 +3202,25 @@ func (t *Terminal) renderEmptyLine(line int, barRange [2]int) {
 	t.renderBar(line, barRange)
 }
 
+func (t *Terminal) gutter(current bool) {
+	var color tui.ColorPair
+	if current {
+		color = tui.ColCurrentCursorEmpty
+	} else if !t.raw && t.gutterReverse || t.raw && t.gutterRawReverse {
+		color = tui.ColCursorEmpty
+	} else {
+		color = tui.ColCursorEmptyChar
+	}
+	gutter := t.pointerEmpty
+	if t.raw {
+		gutter = t.pointerEmptyRaw
+	}
+	t.window.CPrint(color, gutter)
+}
+
 func (t *Terminal) renderGapLine(line int, barRange [2]int, drawLine bool) {
 	t.move(line, 0, false)
-	t.window.CPrint(tui.ColCursorEmpty, t.pointerEmpty)
+	t.gutter(false)
 	t.window.Print(t.markerEmpty)
 	x := t.pointerLen + t.markerLen
 
@@ -3117,7 +3250,8 @@ func (t *Terminal) printList() {
 	for line, itemCount := startLine, 0; line <= maxy; line, itemCount = line+1, itemCount+1 {
 		if itemCount < count {
 			item := t.merger.Get(itemCount + t.offset)
-			line = t.printItem(item, line, maxy, itemCount, itemCount == t.cy-t.offset, barRange)
+			current := itemCount == t.cy-t.offset
+			line = t.printItem(item, line, maxy, itemCount, current, barRange)
 		} else if !t.prevLines[line].empty {
 			t.renderEmptyLine(line, barRange)
 		}
@@ -3139,6 +3273,14 @@ func (t *Terminal) printBar(lineNum int, forceRedraw bool, barRange [2]int) bool
 
 func (t *Terminal) printItem(result Result, line int, maxLine int, index int, current bool, barRange [2]int) int {
 	item := result.item
+	matched := true
+	var matchResult Result
+	if t.raw {
+		if matchResult, matched = t.matchMap[item.Index()]; matched {
+			result = matchResult
+		}
+	}
+
 	_, selected := t.selected[item.Index()]
 	label := ""
 	extraWidth := 0
@@ -3169,7 +3311,7 @@ func (t *Terminal) printItem(result Result, line int, maxLine int, index int, cu
 	// Avoid unnecessary redraw
 	numLines, _ := t.numItemLines(item, maxLine-line+1)
 	newLine := itemLine{valid: true, firstLine: line, numLines: numLines, cy: index + t.offset, current: current, selected: selected, label: label,
-		result: result, queryLen: len(t.input), width: 0, hasBar: line >= barRange[0] && line < barRange[1]}
+		result: result, queryLen: len(t.input), width: 0, hasBar: line >= barRange[0] && line < barRange[1], hidden: !matched}
 	prevLine := t.prevLines[line]
 	forceRedraw := !prevLine.valid || prevLine.other || prevLine.firstLine != newLine.firstLine
 	printBar := func(lineNum int, forceRedraw bool) bool {
@@ -3177,6 +3319,7 @@ func (t *Terminal) printItem(result Result, line int, maxLine int, index int, cu
 	}
 
 	if !forceRedraw &&
+		prevLine.hidden == newLine.hidden &&
 		prevLine.numLines == newLine.numLines &&
 		prevLine.current == newLine.current &&
 		prevLine.selected == newLine.selected &&
@@ -3251,7 +3394,7 @@ func (t *Terminal) printItem(result Result, line int, maxLine int, index int, cu
 				return indentSize
 			}
 			if len(label) == 0 {
-				t.window.CPrint(tui.ColCurrentCursorEmpty, t.pointerEmpty)
+				t.gutter(true)
 			} else {
 				t.window.CPrint(tui.ColCurrentCursor, label)
 			}
@@ -3265,7 +3408,7 @@ func (t *Terminal) printItem(result Result, line int, maxLine int, index int, cu
 			}
 			return indentSize
 		}
-		finalLineNum = t.printHighlighted(result, tui.ColCurrent, tui.ColCurrentMatch, true, true, line, maxLine, forceRedraw, preTask, postTask)
+		finalLineNum = t.printHighlighted(result, tui.ColCurrent, tui.ColCurrentMatch, true, true, !matched, line, maxLine, forceRedraw, preTask, postTask)
 	} else {
 		preTask := func(marker markerClass) int {
 			w := t.window.Width() - t.pointerLen
@@ -3273,7 +3416,7 @@ func (t *Terminal) printItem(result Result, line int, maxLine int, index int, cu
 				return indentSize
 			}
 			if len(label) == 0 {
-				t.window.CPrint(tui.ColCursorEmpty, t.pointerEmpty)
+				t.gutter(false)
 			} else {
 				t.window.CPrint(tui.ColCursor, label)
 			}
@@ -3299,7 +3442,7 @@ func (t *Terminal) printItem(result Result, line int, maxLine int, index int, cu
 			base = base.WithBg(altBg)
 			match = match.WithBg(altBg)
 		}
-		finalLineNum = t.printHighlighted(result, base, match, false, true, line, maxLine, forceRedraw, preTask, postTask)
+		finalLineNum = t.printHighlighted(result, base, match, false, true, !matched, line, maxLine, forceRedraw, preTask, postTask)
 	}
 	for i := 0; i < t.gap && finalLineNum < maxLine; i++ {
 		finalLineNum++
@@ -3346,13 +3489,13 @@ func (t *Terminal) overflow(runes []rune, max int) bool {
 	return t.displayWidthWithLimit(runes, 0, max) > max
 }
 
-func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMatch tui.ColorPair, current bool, match bool, lineNum int, maxLineNum int, forceRedraw bool, preTask func(markerClass) int, postTask func(int, int, bool, bool, tui.ColorPair)) int {
+func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMatch tui.ColorPair, current bool, match bool, hidden bool, lineNum int, maxLineNum int, forceRedraw bool, preTask func(markerClass) int, postTask func(int, int, bool, bool, tui.ColorPair)) int {
 	var displayWidth int
 	item := result.item
 	matchOffsets := []Offset{}
 	var pos *[]int
-	if match && t.merger.pattern != nil {
-		_, matchOffsets, pos = t.merger.pattern.MatchItem(item, true, t.slab)
+	if match && t.resultMerger.pattern != nil {
+		_, matchOffsets, pos = t.resultMerger.pattern.MatchItem(item, true, t.slab)
 	}
 	charOffsets := matchOffsets
 	if pos != nil {
@@ -3384,21 +3527,52 @@ func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMat
 		}
 		if !wholeCovered && t.nthAttr > 0 {
 			var tokens []Token
-			if item.transformed != nil && item.transformed.revision == t.merger.revision {
+			if item.transformed != nil && item.transformed.revision == t.resultMerger.revision {
 				tokens = item.transformed.tokens
 			} else {
 				tokens = Transform(Tokenize(item.text.ToString(), t.delimiter), t.nthCurrent)
 			}
-			for _, token := range tokens {
+			nthOffsets = make([]Offset, len(tokens))
+			for i, token := range tokens {
 				start := token.prefixLength
 				length := token.text.Length() - token.text.TrailingWhitespaces()
 				end := start + int32(length)
-				nthOffsets = append(nthOffsets, Offset{int32(start), int32(end)})
+				nthOffsets[i] = Offset{int32(start), int32(end)}
 			}
 			sort.Sort(ByOrder(nthOffsets))
 		}
 	}
-	allOffsets := result.colorOffsets(charOffsets, nthOffsets, t.theme, colBase, colMatch, t.nthAttr)
+	allOffsets := result.colorOffsets(charOffsets, nthOffsets, t.theme, colBase, colMatch, t.nthAttr, hidden)
+
+	// Determine split offset for horizontal scrolling with freeze
+	splitOffset1 := -1
+	splitOffset2 := -1
+	if t.hscroll && !t.wrap {
+		var tokens []Token
+		if t.freezeLeft > 0 || t.freezeRight > 0 {
+			tokens = Tokenize(item.text.ToString(), t.delimiter)
+		}
+
+		// 0 | 1 | 2 | 3 | 4 | 5
+		// ------>       <------
+		if t.freezeLeft > 0 {
+			if len(tokens) > 0 {
+				token := tokens[util.Min(t.freezeLeft, len(tokens))-1]
+				splitOffset1 = int(token.prefixLength) + token.text.Length() - token.text.TrailingWhitespaces()
+			}
+		}
+		if t.freezeRight > 0 {
+			index := util.Max(t.freezeLeft-1, len(tokens)-t.freezeRight-1)
+			if index < 0 {
+				splitOffset2 = 0
+			} else if index >= t.freezeLeft {
+				token := tokens[index]
+				delimiter := strings.TrimLeftFunc(GetLastDelimiter(token.text.ToString(), t.delimiter), unicode.IsSpace)
+				splitOffset2 = int(token.prefixLength) + token.text.Length() - len([]rune(delimiter))
+			}
+			splitOffset2 = util.Max(splitOffset2, splitOffset1)
+		}
+	}
 
 	maxLines := 1
 	if t.canSpanMultiLines() {
@@ -3469,16 +3643,24 @@ func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMat
 				break
 			}
 		}
+		splitOffsetLeft := 0
+		if splitOffset1 >= 0 && splitOffset1 > from && splitOffset1 < from+len(line) {
+			splitOffsetLeft = splitOffset1 - from
+		}
+		splitOffsetRight := -1
+		if splitOffset2 >= 0 && splitOffset2 >= from && splitOffset2 < from+len(line) {
+			splitOffsetRight = splitOffset2 - from
+		}
 		from += len(line)
 		if lineOffset < skipLines {
 			continue
 		}
 		actualLineOffset := lineOffset - skipLines
 
-		var maxe int
+		var maxEnd int
 		for _, offset := range offsets {
 			if offset.match {
-				maxe = util.Max(maxe, int(offset.offset[1]))
+				maxEnd = util.Max(maxEnd, int(offset.offset[1]))
 			}
 		}
 
@@ -3542,65 +3724,117 @@ func (t *Terminal) printHighlighted(result Result, colBase tui.ColorPair, colMat
 			wrapped = true
 		}
 
-		displayWidth = t.displayWidthWithLimit(line, 0, maxWidth)
-		if !t.wrap && displayWidth > maxWidth {
-			ellipsis, ellipsisWidth := util.Truncate(t.ellipsis, maxWidth/2)
-			maxe = util.Constrain(maxe+util.Min(maxWidth/2-ellipsisWidth, t.hscrollOff), 0, len(line))
-			transformOffsets := func(diff int32, rightTrim bool) {
-				for idx, offset := range offsets {
-					b, e := offset.offset[0], offset.offset[1]
-					el := int32(len(ellipsis))
-					b += el - diff
-					e += el - diff
-					b = util.Max32(b, el)
-					if rightTrim {
-						e = util.Min32(e, int32(maxWidth-ellipsisWidth))
-					}
-					offsets[idx].offset[0] = b
-					offsets[idx].offset[1] = util.Max32(b, e)
-				}
+		frozenLeft := line[:splitOffsetLeft]
+		middle := line[splitOffsetLeft:]
+		frozenRight := []rune{}
+		if splitOffsetRight >= splitOffsetLeft {
+			middle = line[splitOffsetLeft:splitOffsetRight]
+			frozenRight = line[splitOffsetRight:]
+		}
+		displayWidthSum := 0
+		todo := [3]func(){}
+		for fidx, runes := range [][]rune{frozenLeft, frozenRight, middle} {
+			if len(runes) == 0 {
+				continue
 			}
-			if t.hscroll {
-				if t.keepRight && pos == nil {
-					trimmed, diff := t.trimLeft(line, maxWidth, ellipsisWidth)
-					transformOffsets(diff, false)
-					line = append(ellipsis, trimmed...)
-				} else if !t.overflow(line[:maxe], maxWidth-ellipsisWidth) {
-					// Stri..
-					line, _ = t.trimRight(line, maxWidth-ellipsisWidth)
-					line = append(line, ellipsis...)
-				} else {
-					// Stri..
-					rightTrim := false
-					if t.overflow(line[maxe:], ellipsisWidth) {
-						line = append(line[:maxe], ellipsis...)
-						rightTrim = true
+			shift := 0
+			maxe := maxEnd
+			offs := make([]colorOffset, len(offsets))
+			for idx := range offsets {
+				offs[idx] = offsets[idx]
+				if fidx == 1 && splitOffsetRight > 0 {
+					shift = splitOffsetRight
+				} else if fidx == 2 && splitOffsetLeft > 0 {
+					shift = splitOffsetLeft
+				}
+				offs[idx].offset[0] -= int32(shift)
+				offs[idx].offset[1] -= int32(shift)
+			}
+			maxe -= shift
+			ellipsis, ellipsisWidth := util.Truncate(t.ellipsis, maxWidth)
+			adjustedMaxWidth := maxWidth
+			if fidx < 2 {
+				// For frozen parts, reserve space for the ellipsis in the middle part
+				adjustedMaxWidth -= ellipsisWidth
+			}
+			displayWidth = t.displayWidthWithLimit(runes, 0, adjustedMaxWidth)
+			if !t.wrap && displayWidth > adjustedMaxWidth {
+				maxe = util.Constrain(maxe+util.Min(maxWidth/2-ellipsisWidth, t.hscrollOff), 0, len(runes))
+				transformOffsets := func(diff int32, rightTrim bool) {
+					for idx, offset := range offs {
+						b, e := offset.offset[0], offset.offset[1]
+						el := int32(len(ellipsis))
+						b += el - diff
+						e += el - diff
+						b = util.Max32(b, el)
+						if rightTrim {
+							e = util.Min32(e, int32(maxWidth-ellipsisWidth))
+						}
+						offs[idx].offset[0] = b
+						offs[idx].offset[1] = util.Max32(b, e)
 					}
-					// ..ri..
-					var diff int32
-					line, diff = t.trimLeft(line, maxWidth, ellipsisWidth)
+				}
+				if t.hscroll {
+					if fidx == 1 || fidx == 2 && t.keepRight && pos == nil {
+						trimmed, diff := t.trimLeft(runes, maxWidth, ellipsisWidth)
+						transformOffsets(diff, false)
+						runes = append(ellipsis, trimmed...)
+					} else if fidx == 0 || !t.overflow(runes[:maxe], maxWidth-ellipsisWidth) {
+						// Stri..
+						runes, _ = t.trimRight(runes, maxWidth-ellipsisWidth)
+						runes = append(runes, ellipsis...)
+					} else {
+						// Stri..
+						rightTrim := false
+						if t.overflow(runes[maxe:], ellipsisWidth) {
+							runes = append(runes[:maxe], ellipsis...)
+							rightTrim = true
+						}
+						// ..ri..
+						var diff int32
+						runes, diff = t.trimLeft(runes, maxWidth, ellipsisWidth)
 
-					// Transform offsets
-					transformOffsets(diff, rightTrim)
-					line = append(ellipsis, line...)
+						// Transform offsets
+						transformOffsets(diff, rightTrim)
+						runes = append(ellipsis, runes...)
+					}
+				} else {
+					runes, _ = t.trimRight(runes, maxWidth-ellipsisWidth)
+					runes = append(runes, ellipsis...)
+
+					for idx, offset := range offs {
+						offs[idx].offset[0] = util.Min32(offset.offset[0], int32(maxWidth-len(ellipsis)))
+						offs[idx].offset[1] = util.Min32(offset.offset[1], int32(maxWidth))
+					}
+				}
+				displayWidth = t.displayWidthWithLimit(runes, 0, displayWidth)
+			}
+			displayWidthSum += displayWidth
+
+			if maxWidth > 0 {
+				color := colBase
+				if hidden {
+					color = color.WithFg(t.theme.Nomatch)
+				}
+				todo[fidx] = func() {
+					t.printColoredString(t.window, runes, offs, color)
 				}
 			} else {
-				line, _ = t.trimRight(line, maxWidth-ellipsisWidth)
-				line = append(line, ellipsis...)
-
-				for idx, offset := range offsets {
-					offsets[idx].offset[0] = util.Min32(offset.offset[0], int32(maxWidth-len(ellipsis)))
-					offsets[idx].offset[1] = util.Min32(offset.offset[1], int32(maxWidth))
-				}
+				break
 			}
-			displayWidth = t.displayWidthWithLimit(line, 0, displayWidth)
+			maxWidth -= displayWidth
 		}
-
-		if maxWidth > 0 {
-			t.printColoredString(t.window, line, offsets, colBase)
+		if todo[0] != nil {
+			todo[0]()
+		}
+		if todo[2] != nil {
+			todo[2]()
+		}
+		if todo[1] != nil {
+			todo[1]()
 		}
 		if postTask != nil {
-			postTask(actualLineNum, displayWidth, wasWrapped, forceRedraw, lbg)
+			postTask(actualLineNum, displayWidthSum, wasWrapped, forceRedraw, lbg)
 		} else {
 			t.markOtherLine(actualLineNum)
 		}
@@ -3619,7 +3853,7 @@ func (t *Terminal) printColoredString(window tui.Window, text []rune, offsets []
 	for _, offset := range offsets {
 		b := util.Constrain32(offset.offset[0], index, maxOffset)
 		e := util.Constrain32(offset.offset[1], index, maxOffset)
-		if url != nil && offset.url == nil {
+		if url != nil && offset.url != url {
 			url = nil
 			window.LinkEnd()
 		}
@@ -4632,6 +4866,33 @@ func (t *Terminal) currentItem() *Item {
 	return nil
 }
 
+func (t *Terminal) isCurrentItemMatch() bool {
+	cnt := t.merger.Length()
+	if t.cy >= 0 && cnt > 0 && cnt > t.cy {
+		if !t.raw {
+			return true
+		}
+		item := t.merger.Get(t.cy).item
+		return t.isItemMatch(item)
+	}
+	return false
+}
+
+func (t *Terminal) isItemMatch(item *Item) bool {
+	_, matched := t.matchMap[item.Index()]
+	return matched
+}
+
+func (t *Terminal) filterSelected() {
+	filtered := make(map[int32]selectedItem)
+	for k, v := range t.selected {
+		if t.isItemMatch(v.item) {
+			filtered[k] = v
+		}
+	}
+	t.selected = filtered
+}
+
 func (t *Terminal) buildPlusList(template string, forcePlus bool) (bool, [3][]*Item) {
 	current := t.currentItem()
 	slot, plus, asterisk, forceUpdate := hasPreviewFlags(template)
@@ -4655,7 +4916,7 @@ func (t *Terminal) buildPlusList(template string, forcePlus bool) (bool, [3][]*I
 	if asterisk {
 		cnt := t.merger.Length()
 		all = make([]*Item, cnt)
-		for i := 0; i < cnt; i++ {
+		for i := range cnt {
 			all[i] = t.merger.Get(i).item
 		}
 	}
@@ -5372,7 +5633,7 @@ func (t *Terminal) Loop() error {
 	req := func(evts ...util.EventType) {
 		for _, event := range evts {
 			events = append(events, event)
-			if event == reqClose || event == reqQuit {
+			if isTerminalEvent(event) {
 				looping = false
 			}
 		}
@@ -5872,8 +6133,9 @@ func (t *Terminal) Loop() error {
 				}
 			case actSelectAll:
 				if t.multi > 0 {
-					for i := 0; i < t.merger.Length(); i++ {
-						if !t.selectItem(t.merger.Get(i).item) {
+					// Limit the scope only to the matching items
+					for i := 0; i < t.resultMerger.Length(); i++ {
+						if !t.selectItem(t.resultMerger.Get(i).item) {
 							break
 						}
 					}
@@ -5881,8 +6143,10 @@ func (t *Terminal) Loop() error {
 				}
 			case actDeselectAll:
 				if t.multi > 0 {
-					for i := 0; i < t.merger.Length() && len(t.selected) > 0; i++ {
-						t.deselectItem(t.merger.Get(i).item)
+					// Also limit the scope only to the matching items, while this may
+					// not be straightforward in raw mode.
+					for i := 0; i < t.resultMerger.Length() && len(t.selected) > 0; i++ {
+						t.deselectItem(t.resultMerger.Get(i).item)
 					}
 					req(reqList, reqInfo)
 				}
@@ -5910,17 +6174,17 @@ func (t *Terminal) Loop() error {
 			case actToggleAll:
 				if t.multi > 0 {
 					prevIndexes := make(map[int]struct{})
-					for i := 0; i < t.merger.Length() && len(t.selected) > 0; i++ {
-						item := t.merger.Get(i).item
+					for i := 0; i < t.resultMerger.Length() && len(t.selected) > 0; i++ {
+						item := t.resultMerger.Get(i).item
 						if _, found := t.selected[item.Index()]; found {
 							prevIndexes[i] = struct{}{}
 							t.deselectItem(item)
 						}
 					}
 
-					for i := 0; i < t.merger.Length(); i++ {
+					for i := 0; i < t.resultMerger.Length(); i++ {
 						if _, found := prevIndexes[i]; !found {
-							item := t.merger.Get(i).item
+							item := t.resultMerger.Get(i).item
 							if !t.selectItem(item) {
 								break
 							}
@@ -5948,11 +6212,88 @@ func (t *Terminal) Loop() error {
 					t.vmove(1, true)
 					req(reqList)
 				}
-			case actDown:
-				t.vmove(-1, true)
+			case actDown, actDownMatch, actUp, actUpMatch:
+				dir := -1
+				if a.t == actUp || a.t == actUpMatch {
+					dir = 1
+				}
+				if t.raw && (a.t == actDownMatch || a.t == actUpMatch) {
+					if t.resultMerger.Length() > 0 {
+						prevCy := t.cy
+						for t.vmove(dir, true) && !t.isCurrentItemMatch() {
+						}
+						if !t.isCurrentItemMatch() {
+							t.vset(prevCy)
+						}
+					}
+				} else {
+					t.vmove(dir, true)
+				}
 				req(reqList)
-			case actUp:
-				t.vmove(1, true)
+			case actToggleRaw, actEnableRaw, actDisableRaw:
+				prevRaw := t.raw
+				newRaw := t.raw
+				switch a.t {
+				case actEnableRaw:
+					newRaw = true
+				case actDisableRaw:
+					newRaw = false
+				case actToggleRaw:
+					newRaw = !t.raw
+				}
+				if prevRaw == newRaw {
+					break
+				}
+				prevPos := t.cy - t.offset
+				prevIndex := t.currentIndex()
+				if newRaw {
+					// Build matchMap if not available
+					if len(t.matchMap) == 0 {
+						t.matchMap = t.resultMerger.ToMap()
+					}
+					t.merger = t.passMerger
+				} else {
+					// Find the closest matching item
+					if !t.isCurrentItemMatch() && t.resultMerger.Length() > 1 {
+						distance := 0
+					Loop:
+						for {
+							distance++
+							checks := 0
+							for _, cy := range []int{t.cy + distance, t.cy - distance} {
+								if cy >= 0 && cy < t.merger.Length() {
+									checks++
+									item := t.merger.Get(cy).item
+									if t.isItemMatch(item) {
+										prevIndex = item.Index()
+										break Loop
+									}
+								}
+							}
+							if checks == 0 {
+								break
+							}
+						}
+					}
+
+					t.merger = t.resultMerger
+
+					// Need to remove non-matching items from the selection
+					if t.multi > 0 && len(t.selected) > 0 {
+						t.filterSelected()
+						req(reqInfo)
+					}
+				}
+				t.raw = newRaw
+
+				// Try to retain position
+				if prevIndex != minItem.Index() {
+					t.cy = util.Max(0, t.merger.FindIndex(prevIndex))
+					t.offset = t.cy - prevPos
+				}
+
+				// List needs to be rerendered
+				t.forceRerenderList()
 				req(reqList)
 			case actAccept:
 				req(reqClose)
@@ -5977,8 +6318,14 @@ func (t *Terminal) Loop() error {
 					t.version++
 					req(reqList, reqInfo)
 				}
-			case actFirst:
-				t.vset(0)
+			case actFirst, actBest:
+				if t.raw && a.t == actBest {
+					if t.resultMerger.Length() > 0 {
+						t.vset(t.merger.FindIndex(t.resultMerger.Get(0).item.Index()))
+					}
+				} else {
+					t.vset(0)
+				}
 				t.constrain()
 				req(reqList)
 			case actLast:
@@ -6019,6 +6366,11 @@ func (t *Terminal) Loop() error {
 				beof = len(t.input) == 0
 				if t.cx > 0 {
 					t.rubout(t.wordRubout)
+				}
+			case actBackwardKillSubWord:
+				beof = len(t.input) == 0
+				if t.cx > 0 {
+					t.rubout(t.subWordRubout)
 				}
 			case actYank:
 				suffix := copySlice(t.input[t.cx:])
@@ -6101,7 +6453,7 @@ func (t *Terminal) Loop() error {
 				if a.t == actOffsetDown {
 					diff = -1
 				}
-				if t.layout == layoutReverse {
+				if t.layout != layoutDefault {
 					diff *= -1
 				}
 				t.offset += diff
@@ -6109,7 +6461,7 @@ func (t *Terminal) Loop() error {
 				t.constrain()
 				if before != t.offset {
 					t.offset = before
-					if t.layout == layoutReverse {
+					if t.layout != layoutDefault {
 						diff *= -1
 					}
 					t.vmove(diff, false)
@@ -6131,9 +6483,20 @@ func (t *Terminal) Loop() error {
 				t.cx = findLastMatch(t.wordRubout, string(t.input[:t.cx])) + 1
 			case actForwardWord:
 				t.cx += findFirstMatch(t.wordNext, string(t.input[t.cx:])) + 1
+			case actBackwardSubWord:
+				t.cx = findLastMatch(t.subWordRubout, string(t.input[:t.cx])) + 1
+			case actForwardSubWord:
+				t.cx += findFirstMatch(t.subWordNext, string(t.input[t.cx:])) + 1
 			case actKillWord:
 				ncx := t.cx +
 					findFirstMatch(t.wordNext, string(t.input[t.cx:])) + 1
+				if ncx > t.cx {
+					t.yanked = copySlice(t.input[t.cx:ncx])
+					t.input = append(t.input[:t.cx], t.input[ncx:]...)
+				}
+			case actKillSubWord:
+				ncx := t.cx +
+					findFirstMatch(t.subWordNext, string(t.input[t.cx:])) + 1
 				if ncx > t.cx {
 					t.yanked = copySlice(t.input[t.cx:ncx])
 					t.input = append(t.input[:t.cx], t.input[ncx:]...)
@@ -6780,7 +7143,7 @@ func (t *Terminal) Loop() error {
 		reload := changed || newCommand != nil
 		var reloadRequest *searchRequest
 		if reload {
-			reloadRequest = &searchRequest{sort: t.sort, sync: reloadSync, nth: newNth, command: newCommand, environ: t.environ(), changed: changed, denylist: denylist, revision: t.merger.Revision()}
+			reloadRequest = &searchRequest{sort: t.sort, sync: reloadSync, nth: newNth, command: newCommand, environ: t.environ(), changed: changed, denylist: denylist, revision: t.resultMerger.Revision()}
 		}
 
 		// Dispatch queued background requests
@@ -6805,7 +7168,7 @@ func (t *Terminal) constrain() {
 
 	// May need to try again after adjusting the offset
 	t.offset = util.Constrain(t.offset, 0, count)
-	for tries := 0; tries < maxLines; tries++ {
+	for range maxLines {
 		numItems := maxLines
 		// How many items can be fit on screen including the current item?
 		if t.canSpanMultiLines() && t.merger.Length() > 0 {
@@ -6859,7 +7222,7 @@ func (t *Terminal) constrain() {
 			scrollOff := util.Min(maxLines/2, t.scrollOff)
 			newOffset := t.offset
 			// 2-phase adjustment to avoid infinite loop of alternating between moving up and down
-			for phase := 0; phase < 2; phase++ {
+			for phase := range 2 {
 				for {
 					prevOffset := newOffset
 					numItems := t.merger.Length()
@@ -6900,7 +7263,8 @@ func (t *Terminal) constrain() {
 	}
 }
 
-func (t *Terminal) vmove(o int, allowCycle bool) {
+// Returns true if the cursor position is successfully updated
+func (t *Terminal) vmove(o int, allowCycle bool) bool {
 	if t.layout != layoutDefault {
 		o *= -1
 	}
@@ -6917,7 +7281,7 @@ func (t *Terminal) vmove(o int, allowCycle bool) {
 			}
 		}
 	}
-	t.vset(dest)
+	return t.vset(dest)
 }
 
 func (t *Terminal) vset(o int) bool {
@@ -6984,9 +7348,9 @@ func (t *Terminal) dumpStatus(params getParams) string {
 		selected[i] = t.dumpItem(selectedItems[i+params.offset].item)
 	}
 
-	matches := make([]StatusItem, util.Max(0, util.Min(params.limit, t.merger.Length()-params.offset)))
+	matches := make([]StatusItem, util.Max(0, util.Min(params.limit, t.resultMerger.Length()-params.offset)))
 	for i := range matches {
-		matches[i] = t.dumpItem(t.merger.Get(i + params.offset).item)
+		matches[i] = t.dumpItem(t.resultMerger.Get(i + params.offset).item)
 	}
 
 	var current *StatusItem
@@ -7003,7 +7367,7 @@ func (t *Terminal) dumpStatus(params getParams) string {
 		Position:   t.cy,
 		Sort:       t.sort,
 		TotalCount: t.count,
-		MatchCount: t.merger.Length(),
+		MatchCount: t.resultMerger.Length(),
 		Current:    current,
 		Matches:    matches,
 		Selected:   selected,
