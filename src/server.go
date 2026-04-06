@@ -122,13 +122,12 @@ func startHttpServer(address listenAddress, actionChannel chan []*action, getHan
 		}
 	}
 
-	server := httpServer{
-		apiKey:        []byte(apiKey),
-		actionChannel: actionChannel,
-		getHandler:    getHandler,
-	}
-
 	go func() {
+		server := httpServer{
+			apiKey:        []byte(apiKey),
+			actionChannel: actionChannel,
+			getHandler:    getHandler,
+		}
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
@@ -183,23 +182,22 @@ func (server *httpServer) handleHttpRequest(conn net.Conn) string {
 	})
 
 	section := 0
+	var getMatch []string
+Loop:
 	for scanner.Scan() {
 		text := scanner.Text()
 		switch section {
-		case 0:
-			getMatch := getRegex.FindStringSubmatch(text)
-			if len(getMatch) > 0 {
-				response := server.getHandler(parseGetParams(getMatch[1]))
-				if len(response) > 0 {
-					return good(response)
-				}
-				return answer(httpUnavailable+jsonContentType, `{"error":"timeout"}`)
-			} else if !strings.HasPrefix(text, "POST / HTTP") {
+		case 0: // Request line
+			getMatch = getRegex.FindStringSubmatch(text)
+			if len(getMatch) == 0 && !strings.HasPrefix(text, "POST / HTTP") {
 				return bad("invalid request method")
 			}
 			section++
-		case 1:
-			if text == crlf {
+		case 1: // Request headers
+			if text == crlf { // End of headers
+				if len(getMatch) > 0 {
+					break Loop
+				}
 				if contentLength == 0 {
 					return bad("content-length header missing")
 				}
@@ -219,13 +217,21 @@ func (server *httpServer) handleHttpRequest(conn net.Conn) string {
 					apiKey = strings.TrimSpace(pair[1])
 				}
 			}
-		case 2:
+		case 2: // Request body
 			body += text
 		}
 	}
 
 	if len(server.apiKey) != 0 && subtle.ConstantTimeCompare([]byte(apiKey), server.apiKey) != 1 {
 		return unauthorized("invalid api key")
+	}
+
+	if len(getMatch) > 0 {
+		response := server.getHandler(parseGetParams(getMatch[1]))
+		if len(response) > 0 {
+			return good(response)
+		}
+		return answer(httpUnavailable+jsonContentType, `{"error":"timeout"}`)
 	}
 
 	if len(body) < contentLength {

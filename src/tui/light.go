@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/junegunn/fzf/src/util"
-	"github.com/rivo/uniseg"
 
 	"golang.org/x/term"
 )
@@ -26,6 +25,7 @@ const (
 	escPollInterval = 5
 	offsetPollTries = 10
 	maxInputBuffer  = 1024 * 1024
+	maxSelectTries  = 100
 )
 
 const DefaultTtyDevice string = "/dev/tty"
@@ -48,6 +48,18 @@ func (r *LightRenderer) stderr(str string) {
 const DIM string = "\x1b[2m"
 const CR string = DIM + "␍"
 const LF string = DIM + "␊"
+
+type getCharResult int
+
+const (
+	getCharSuccess getCharResult = iota
+	getCharError
+	getCharCancelled
+)
+
+func (r getCharResult) ok() bool {
+	return r == getCharSuccess
+}
 
 func (r *LightRenderer) stderrInternal(str string, allowNLCR bool, resetCode string) {
 	bytes := []byte(str)
@@ -104,6 +116,7 @@ type LightRenderer struct {
 	clicks        [][2]int
 	ttyin         *os.File
 	ttyout        *os.File
+	cancel        func()
 	buffer        []byte
 	origState     *term.State
 	width         int
@@ -118,9 +131,9 @@ type LightRenderer struct {
 	x             int
 	maxHeightFunc func(int) int
 	showCursor    bool
+	mutex         sync.Mutex
 
 	// Windows only
-	mutex           sync.Mutex
 	ttyinChannel    chan byte
 	inHandle        uintptr
 	outHandle       uintptr
@@ -193,11 +206,6 @@ func (r *LightRenderer) Init() error {
 	if r.fullscreen {
 		r.smcup()
 	} else {
-		// We assume that --no-clear is used for repetitive relaunching of fzf.
-		// So we do not clear the lower bottom of the screen.
-		if r.clearOnExit {
-			r.csi("J")
-		}
 		y, x := r.findOffset()
 		r.mouse = r.mouse && y >= 0
 		// When --no-clear is used for repetitive relaunching, there is a small
@@ -207,6 +215,11 @@ func (r *LightRenderer) Init() error {
 		if x > 0 && r.clearOnExit {
 			r.upOneLine = true
 			r.makeSpace()
+		}
+		// We assume that --no-clear is used for repetitive relaunching of fzf.
+		// So we do not clear the lower bottom of the screen.
+		if r.clearOnExit {
+			r.csi("J")
 		}
 		for i := 1; i < r.MaxY(); i++ {
 			r.makeSpace()
@@ -262,16 +275,18 @@ func getEnv(name string, defaultValue int) int {
 	return atoi(env, defaultValue)
 }
 
-func (r *LightRenderer) getBytes() ([]byte, error) {
-	bytes, err := r.getBytesInternal(r.buffer, false)
-	return bytes, err
+func (r *LightRenderer) getBytes(cancellable bool) ([]byte, getCharResult, error) {
+	return r.getBytesInternal(cancellable, r.buffer, false)
 }
 
-func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) ([]byte, error) {
-	c, ok := r.getch(nonblock)
-	if !nonblock && !ok {
+func (r *LightRenderer) getBytesInternal(cancellable bool, buffer []byte, nonblock bool) ([]byte, getCharResult, error) {
+	c, result := r.getch(cancellable, nonblock)
+	if result == getCharCancelled {
+		return buffer, getCharCancelled, nil
+	}
+	if !nonblock && !result.ok() {
 		r.Close()
-		return nil, errors.New("failed to read " + DefaultTtyDevice)
+		return nil, getCharError, errors.New("failed to read " + DefaultTtyDevice)
 	}
 
 	retries := 0
@@ -282,8 +297,8 @@ func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) ([]byte, 
 
 	pc := c
 	for {
-		c, ok = r.getch(true)
-		if !ok {
+		c, result = r.getch(false, true)
+		if !result.ok() {
 			if retries > 0 {
 				retries--
 				time.Sleep(escPollInterval * time.Millisecond)
@@ -302,19 +317,23 @@ func (r *LightRenderer) getBytesInternal(buffer []byte, nonblock bool) ([]byte, 
 		// so terminate fzf immediately.
 		if len(buffer) > maxInputBuffer {
 			r.Close()
-			return nil, fmt.Errorf("input buffer overflow (%d): %v", len(buffer), buffer)
+			return nil, getCharError, fmt.Errorf("input buffer overflow (%d): %v", len(buffer), buffer)
 		}
 	}
 
-	return buffer, nil
+	return buffer, getCharSuccess, nil
 }
 
-func (r *LightRenderer) GetChar() Event {
+func (r *LightRenderer) GetChar(cancellable bool) Event {
 	var err error
+	var result getCharResult
 	if len(r.buffer) == 0 {
-		r.buffer, err = r.getBytes()
+		r.buffer, result, err = r.getBytes(cancellable)
 		if err != nil {
 			return Event{Fatal, 0, nil}
+		}
+		if result == getCharCancelled {
+			return Event{Invalid, 0, nil}
 		}
 	}
 	if len(r.buffer) == 0 {
@@ -351,9 +370,14 @@ func (r *LightRenderer) GetChar() Event {
 		ev := r.escSequence(&sz)
 		// Second chance
 		if ev.Type == Invalid {
-			if r.buffer, err = r.getBytes(); err != nil {
+			r.buffer, result, err = r.getBytes(true)
+			if err != nil {
 				return Event{Fatal, 0, nil}
 			}
+			if result == getCharCancelled {
+				return Event{Invalid, 0, nil}
+			}
+
 			ev = r.escSequence(&sz)
 		}
 		return ev
@@ -369,6 +393,21 @@ func (r *LightRenderer) GetChar() Event {
 	}
 	sz = rsz
 	return Event{Rune, char, nil}
+}
+
+func (r *LightRenderer) CancelGetChar() {
+	r.mutex.Lock()
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+	r.mutex.Unlock()
+}
+
+func (r *LightRenderer) setCancel(f func()) {
+	r.mutex.Lock()
+	r.cancel = f
+	r.mutex.Unlock()
 }
 
 func (r *LightRenderer) escSequence(sz *int) Event {
@@ -1033,8 +1072,8 @@ func (r *LightRenderer) MaxY() int {
 }
 
 func (r *LightRenderer) NewWindow(top int, left int, width int, height int, windowType WindowType, borderStyle BorderStyle, erase bool) Window {
-	width = util.Max(0, width)
-	height = util.Max(0, height)
+	width = max(0, width)
+	height = max(0, height)
 	w := &LightWindow{
 		renderer:   r,
 		colored:    r.theme.Colored,
@@ -1283,7 +1322,18 @@ func attrCodes(attr Attr) []string {
 		codes = append(codes, "3")
 	}
 	if (attr & Underline) > 0 {
-		codes = append(codes, "4")
+		switch attr.UnderlineStyle() {
+		case UlStyleDouble:
+			codes = append(codes, "4:2")
+		case UlStyleCurly:
+			codes = append(codes, "4:3")
+		case UlStyleDotted:
+			codes = append(codes, "4:4")
+		case UlStyleDashed:
+			codes = append(codes, "4:5")
+		default:
+			codes = append(codes, "4")
+		}
 	}
 	if (attr & Blink) > 0 {
 		codes = append(codes, "5")
@@ -1321,8 +1371,27 @@ func colorCodes(fg Color, bg Color) []string {
 	return codes
 }
 
-func (w *LightWindow) csiColor(fg Color, bg Color, attr Attr) (bool, string) {
+func ulColorCode(c Color) string {
+	if c == colDefault {
+		return ""
+	}
+	if c.is24() {
+		r := (c >> 16) & 0xff
+		g := (c >> 8) & 0xff
+		b := (c) & 0xff
+		return fmt.Sprintf("58;2;%d;%d;%d", r, g, b)
+	}
+	if c >= 0 && c < 256 {
+		return fmt.Sprintf("58;5;%d", c)
+	}
+	return ""
+}
+
+func (w *LightWindow) csiColor(fg Color, bg Color, ul Color, attr Attr) (bool, string) {
 	codes := append(attrCodes(attr), colorCodes(fg, bg)...)
+	if ulCode := ulColorCode(ul); ulCode != "" {
+		codes = append(codes, ulCode)
+	}
 	code := w.csi(";" + strings.Join(codes, ";") + "m")
 	return len(codes) > 0, code
 }
@@ -1336,65 +1405,28 @@ func cleanse(str string) string {
 }
 
 func (w *LightWindow) CPrint(pair ColorPair, text string) {
-	_, code := w.csiColor(pair.Fg(), pair.Bg(), pair.Attr())
+	_, code := w.csiColor(pair.Fg(), pair.Bg(), pair.Ul(), pair.Attr())
 	w.stderrInternal(cleanse(text), false, code)
 	w.csi("0m")
 }
 
 func (w *LightWindow) cprint2(fg Color, bg Color, attr Attr, text string) {
-	hasColors, code := w.csiColor(fg, bg, attr)
+	hasColors, code := w.csiColor(fg, bg, colDefault, attr)
 	if hasColors {
 		defer w.csi("0m")
 	}
 	w.stderrInternal(cleanse(text), false, code)
 }
 
-type wrappedLine struct {
-	text         string
-	displayWidth int
-}
-
-func wrapLine(input string, prefixLength int, initialMax int, tabstop int, wrapSignWidth int) []wrappedLine {
-	lines := []wrappedLine{}
-	width := 0
-	line := ""
-	gr := uniseg.NewGraphemes(input)
-	max := initialMax
-	for gr.Next() {
-		rs := gr.Runes()
-		str := string(rs)
-		var w int
-		if len(rs) == 1 && rs[0] == '\t' {
-			w = tabstop - (prefixLength+width)%tabstop
-			str = repeat(' ', w)
-		} else if rs[0] == '\r' {
-			w++
-		} else {
-			w = uniseg.StringWidth(str)
-		}
-		width += w
-
-		if prefixLength+width <= max {
-			line += str
-		} else {
-			lines = append(lines, wrappedLine{string(line), width - w})
-			line = str
-			prefixLength = 0
-			width = w
-			max = initialMax - wrapSignWidth
-		}
-	}
-	lines = append(lines, wrappedLine{string(line), width})
-	return lines
-}
-
 func (w *LightWindow) fill(str string, resetCode string) FillReturn {
 	allLines := strings.Split(str, "\n")
 	for i, line := range allLines {
-		lines := wrapLine(line, w.posx, w.width, w.tabstop, w.wrapSignWidth)
+		lines := WrapLine(line, w.posx, w.width, w.tabstop, w.wrapSignWidth)
 		for j, wl := range lines {
-			w.stderrInternal(wl.text, false, resetCode)
-			w.posx += wl.displayWidth
+			if w.posx < w.width {
+				w.stderrInternal(wl.Text, false, resetCode)
+				w.posx += wl.DisplayWidth
+			}
 
 			// Wrap line
 			if j < len(lines)-1 || i < len(allLines)-1 {
@@ -1432,7 +1464,7 @@ func (w *LightWindow) fill(str string, resetCode string) FillReturn {
 
 func (w *LightWindow) setBg() string {
 	if w.bg != colDefault {
-		_, code := w.csiColor(colDefault, w.bg, AttrRegular)
+		_, code := w.csiColor(colDefault, w.bg, colDefault, AttrRegular)
 		return code
 	}
 	// Should clear dim attribute after ␍ in the preview window
@@ -1454,7 +1486,7 @@ func (w *LightWindow) Fill(text string) FillReturn {
 	return w.fill(text, code)
 }
 
-func (w *LightWindow) CFill(fg Color, bg Color, attr Attr, text string) FillReturn {
+func (w *LightWindow) CFill(fg Color, bg Color, ul Color, attr Attr, text string) FillReturn {
 	w.Move(w.posy, w.posx)
 	if fg == colDefault {
 		fg = w.fg
@@ -1462,7 +1494,7 @@ func (w *LightWindow) CFill(fg Color, bg Color, attr Attr, text string) FillRetu
 	if bg == colDefault {
 		bg = w.bg
 	}
-	if hasColors, resetCode := w.csiColor(fg, bg, attr); hasColors {
+	if hasColors, resetCode := w.csiColor(fg, bg, ul, attr); hasColors {
 		defer w.csi("0m")
 		return w.fill(text, resetCode)
 	}

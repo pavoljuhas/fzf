@@ -5,6 +5,7 @@ package tui
 import (
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -53,6 +54,7 @@ type TcellWindow struct {
 	showCursor    bool
 	wrapSign      string
 	wrapSignWidth int
+	tabstop       int
 }
 
 func (w *TcellWindow) Top() int {
@@ -246,7 +248,7 @@ func (r *FullscreenRenderer) Size() TermSize {
 	return TermSize{lines, cols, 0, 0}
 }
 
-func (r *FullscreenRenderer) GetChar() Event {
+func (r *FullscreenRenderer) GetChar(cancellable bool) Event {
 	ev := _screen.PollEvent()
 	switch ev := ev.(type) {
 	case *tcell.EventPaste:
@@ -703,6 +705,10 @@ func (r *FullscreenRenderer) GetChar() Event {
 	return Event{Invalid, 0, nil}
 }
 
+func (r *FullscreenRenderer) CancelGetChar() {
+	// TODO
+}
+
 func (r *FullscreenRenderer) Pause(clear bool) {
 	if clear {
 		_screen.Suspend()
@@ -729,8 +735,8 @@ func (r *FullscreenRenderer) RefreshWindows(windows []Window) {
 }
 
 func (r *FullscreenRenderer) NewWindow(top int, left int, width int, height int, windowType WindowType, borderStyle BorderStyle, erase bool) Window {
-	width = util.Max(0, width)
-	height = util.Max(0, height)
+	width = max(0, width)
+	height = max(0, height)
 	normal := ColBorder
 	switch windowType {
 	case WindowList:
@@ -753,7 +759,8 @@ func (r *FullscreenRenderer) NewWindow(top int, left int, width int, height int,
 		height:      height,
 		normal:      normal,
 		borderStyle: borderStyle,
-		showCursor:  r.showCursor}
+		showCursor:  r.showCursor,
+		tabstop:     r.tabstop}
 	w.Erase()
 	return w
 }
@@ -821,6 +828,21 @@ func (w *TcellWindow) withUrl(style tcell.Style) tcell.Style {
 	return style
 }
 
+func underlineStyleFromAttr(a Attr) tcell.UnderlineStyle {
+	switch a.UnderlineStyle() {
+	case UlStyleDouble:
+		return tcell.UnderlineStyleDouble
+	case UlStyleCurly:
+		return tcell.UnderlineStyleCurly
+	case UlStyleDotted:
+		return tcell.UnderlineStyleDotted
+	case UlStyleDashed:
+		return tcell.UnderlineStyleDashed
+	default:
+		return tcell.UnderlineStyleSolid
+	}
+}
+
 func (w *TcellWindow) printString(text string, pair ColorPair) {
 	lx := 0
 	a := pair.Attr()
@@ -829,11 +851,18 @@ func (w *TcellWindow) printString(text string, pair ColorPair) {
 	if a&AttrClear == 0 {
 		style = style.
 			Reverse(a&Attr(tcell.AttrReverse) != 0).
-			Underline(a&Attr(tcell.AttrUnderline) != 0).
 			StrikeThrough(a&Attr(tcell.AttrStrikeThrough) != 0).
 			Italic(a&Attr(tcell.AttrItalic) != 0).
 			Blink(a&Attr(tcell.AttrBlink) != 0).
 			Dim(a&Attr(tcell.AttrDim) != 0)
+		if a&Attr(tcell.AttrUnderline) != 0 {
+			style = style.Underline(underlineStyleFromAttr(a))
+			if pair.Ul() != colDefault {
+				style = style.Underline(asTcellColor(pair.Ul()))
+			}
+		} else {
+			style = style.Underline(false)
+		}
 	}
 	style = w.withUrl(style)
 
@@ -868,10 +897,8 @@ func (w *TcellWindow) CPrint(pair ColorPair, text string) {
 	w.printString(text, pair)
 }
 
-func (w *TcellWindow) fillString(text string, pair ColorPair) FillReturn {
-	lx := 0
+func (w *TcellWindow) pairStyle(pair ColorPair) tcell.Style {
 	a := pair.Attr()
-
 	var style tcell.Style
 	if w.color {
 		style = pair.style()
@@ -883,64 +910,73 @@ func (w *TcellWindow) fillString(text string, pair ColorPair) FillReturn {
 		Bold(a&Attr(tcell.AttrBold) != 0 || a&BoldForce != 0).
 		Dim(a&Attr(tcell.AttrDim) != 0).
 		Reverse(a&Attr(tcell.AttrReverse) != 0).
-		Underline(a&Attr(tcell.AttrUnderline) != 0).
 		StrikeThrough(a&Attr(tcell.AttrStrikeThrough) != 0).
 		Italic(a&Attr(tcell.AttrItalic) != 0)
-	style = w.withUrl(style)
+	if a&Attr(tcell.AttrUnderline) != 0 {
+		style = style.Underline(underlineStyleFromAttr(a))
+		if pair.Ul() != colDefault {
+			style = style.Underline(asTcellColor(pair.Ul()))
+		}
+	} else {
+		style = style.Underline(false)
+	}
+	return w.withUrl(style)
+}
 
+func (w *TcellWindow) renderGraphemes(text string, style tcell.Style) {
 	gr := uniseg.NewGraphemes(text)
-Loop:
 	for gr.Next() {
 		st := style
 		rs := gr.Runes()
-		if len(rs) == 1 {
-			r := rs[0]
-			switch r {
-			case '\r':
-				st = style.Dim(true)
-				rs[0] = '␍'
-			case '\n':
-				w.lastY++
-				w.lastX = 0
-				lx = 0
-				continue Loop
-			}
+		if len(rs) == 1 && rs[0] == '\r' {
+			st = style.Dim(true)
+			rs[0] = '␍'
 		}
 
-		// word wrap:
-		xPos := w.left + w.lastX + lx
-		if xPos >= w.left+w.width {
-			w.lastY++
-			if w.lastY >= w.height {
-				return FillSuspend
-			}
-			w.lastX = 0
-			lx = 0
-			xPos = w.left
-			sign := w.wrapSign
-			if w.wrapSignWidth > w.width {
-				runes, _ := util.Truncate(sign, w.width)
-				sign = string(runes)
-			}
-			wgr := uniseg.NewGraphemes(sign)
-			for wgr.Next() {
-				rs := wgr.Runes()
-				_screen.SetContent(w.left+lx, w.top+w.lastY, rs[0], rs[1:], style.Dim(true))
-				lx += uniseg.StringWidth(string(rs))
-			}
-			xPos = w.left + lx
-		}
-
+		xPos := w.left + w.lastX
 		yPos := w.top + w.lastY
-		if yPos >= (w.top + w.height) {
-			return FillSuspend
+		if xPos < (w.left+w.width) && yPos < (w.top+w.height) {
+			_screen.SetContent(xPos, yPos, rs[0], rs[1:], st)
 		}
-
-		_screen.SetContent(xPos, yPos, rs[0], rs[1:], st)
-		lx += util.StringWidth(string(rs))
+		w.lastX += util.StringWidth(string(rs))
 	}
-	w.lastX += lx
-	if w.lastX == w.width {
+}
+
+func (w *TcellWindow) renderWrapSign(style tcell.Style) {
+	sign := w.wrapSign
+	if w.wrapSignWidth > w.width {
+		runes, _ := util.Truncate(sign, w.width)
+		sign = string(runes)
+	}
+	gr := uniseg.NewGraphemes(sign)
+	for gr.Next() {
+		rs := gr.Runes()
+		_screen.SetContent(w.left+w.lastX, w.top+w.lastY, rs[0], rs[1:], style.Dim(true))
+		w.lastX += uniseg.StringWidth(string(rs))
+	}
+}
+
+func (w *TcellWindow) fillString(text string, pair ColorPair) FillReturn {
+	style := w.pairStyle(pair)
+
+	for i, segment := range strings.Split(text, "\n") {
+		for j, wl := range WrapLine(segment, w.lastX, w.width, w.tabstop, w.wrapSignWidth) {
+			if i > 0 || j > 0 {
+				w.lastY++
+				if w.lastY >= w.height {
+					return FillSuspend
+				}
+				w.lastX = 0
+				if j > 0 {
+					w.renderWrapSign(style)
+				}
+			}
+			if w.lastX < w.width {
+				w.renderGraphemes(wl.Text, style)
+			}
+		}
+	}
+	if w.lastX >= w.width {
 		w.lastY++
 		w.lastX = 0
 		return FillNextLine
@@ -963,14 +999,14 @@ func (w *TcellWindow) LinkEnd() {
 	w.params = nil
 }
 
-func (w *TcellWindow) CFill(fg Color, bg Color, a Attr, str string) FillReturn {
+func (w *TcellWindow) CFill(fg Color, bg Color, ul Color, a Attr, str string) FillReturn {
 	if fg == colDefault {
 		fg = w.normal.Fg()
 	}
 	if bg == colDefault {
 		bg = w.normal.Bg()
 	}
-	return w.fillString(str, NewColorPair(fg, bg, a))
+	return w.fillString(str, NewColorPair(fg, bg, a).WithUl(ul))
 }
 
 func (w *TcellWindow) DrawBorder() {

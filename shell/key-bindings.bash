@@ -4,7 +4,6 @@
 #  / __/ / /_/ __/
 # /_/   /___/_/ key-bindings.bash
 #
-# - $FZF_TMUX_OPTS
 # - $FZF_CTRL_T_COMMAND
 # - $FZF_CTRL_T_OPTS
 # - $FZF_CTRL_R_COMMAND
@@ -25,9 +24,9 @@ if [[ $- =~ i ]]; then
 # the changes. See code comments in "common.sh" for the implementation details.
 
 __fzf_defaults() {
-  printf '%s\n' "--height ${FZF_TMUX_HEIGHT:-40%} --min-height 20+ --bind=ctrl-z:ignore $1"
+  builtin printf '%s\n' "--height ${FZF_TMUX_HEIGHT:-40%} --min-height 20+ --bind=ctrl-z:ignore $1"
   command cat "${FZF_DEFAULT_OPTS_FILE-}" 2> /dev/null
-  printf '%s\n' "${FZF_DEFAULT_OPTS-} $2"
+  builtin printf '%s\n' "${FZF_DEFAULT_OPTS-} $2"
 }
 
 __fzf_exec_awk() {
@@ -77,17 +76,31 @@ __fzf_cd__() {
   ) && printf 'builtin cd -- %q' "$(builtin unset CDPATH && builtin cd -- "$dir" && builtin pwd)"
 }
 
+__fzf_history_delete() {
+  [[ -s $1 ]] || return
+
+  local offsets
+  offsets=($(sort -rnu "$1"))
+  for offset in "${offsets[@]}"; do
+    builtin history -d "$offset"
+  done
+}
+
 if command -v perl > /dev/null; then
   __fzf_history__() {
-    local output script
+    local output script deletefile
+    deletefile=$(mktemp)
     script='BEGIN { getc; $/ = "\n\t"; $HISTCOUNT = $ENV{last_hist} + 1 } s/^[ *]//; s/\n/\n\t/gm; print $HISTCOUNT - $. . "\t$_" if !$seen{$_}++'
     output=$(
       set +o pipefail
       builtin fc -lnr -2147483648 |
         last_hist=$(HISTTIMEFORMAT='' builtin history 1) command perl -n -l0 -e "$script" |
-        FZF_DEFAULT_OPTS=$(__fzf_defaults "" "-n2..,.. --scheme=history --bind=ctrl-r:toggle-sort,alt-r:toggle-raw --wrap-sign '"$'\t'"↳ ' --highlight-line ${FZF_CTRL_R_OPTS-} +m --read0") \
+        FZF_DEFAULT_OPTS=$(__fzf_defaults "" "-n2..,.. --scheme=history --bind=ctrl-r:toggle-sort,alt-r:toggle-raw --wrap-sign '"$'\t'"↳ ' --highlight-line --bind 'shift-delete:execute-silent(cat {+f1} >> \"$deletefile\")+exclude-multi' --multi ${FZF_CTRL_R_OPTS-} --read0") \
         FZF_DEFAULT_OPTS_FILE='' $(__fzfcmd) --query "$READLINE_LINE"
-    ) || return
+    )
+    __fzf_history_delete "$deletefile"
+    command rm -f "$deletefile"
+    [[ -n $output ]] || return
     READLINE_LINE=$(command perl -pe 's/^\d*\t//' <<< "$output")
     if [[ -z $READLINE_POINT ]]; then
       echo "$READLINE_LINE"
@@ -97,7 +110,8 @@ if command -v perl > /dev/null; then
   }
 else # awk - fallback for POSIX systems
   __fzf_history__() {
-    local output script
+    local output script deletefile
+    deletefile=$(mktemp)
     [[ $(HISTTIMEFORMAT='' builtin history 1) =~ [[:digit:]]+ ]] # how many history entries
     script='function P(b) { ++n; sub(/^[ *]/, "", b); if (!seen[b]++) { printf "%d\t%s%c", '$((BASH_REMATCH + 1))' - n, b, 0 } }
     NR==1 { b = substr($0, 2); next }
@@ -108,9 +122,12 @@ else # awk - fallback for POSIX systems
       set +o pipefail
       builtin fc -lnr -2147483648 2> /dev/null | # ( $'\t '<lines>$'\n' )* ; <lines> ::= [^\n]* ( $'\n'<lines> )*
         __fzf_exec_awk "$script" |               # ( <counter>$'\t'<lines>$'\000' )*
-        FZF_DEFAULT_OPTS=$(__fzf_defaults "" "-n2..,.. --scheme=history --bind=ctrl-r:toggle-sort,alt-r:toggle-raw --wrap-sign '"$'\t'"↳ ' --highlight-line ${FZF_CTRL_R_OPTS-} +m --read0") \
+        FZF_DEFAULT_OPTS=$(__fzf_defaults "" "-n2..,.. --scheme=history --bind=ctrl-r:toggle-sort,alt-r:toggle-raw --wrap-sign '"$'\t'"↳ ' --highlight-line --bind 'shift-delete:execute-silent(cat {+f1} >> \"$deletefile\")+exclude-multi' --multi ${FZF_CTRL_R_OPTS-} --read0") \
         FZF_DEFAULT_OPTS_FILE='' $(__fzfcmd) --query "$READLINE_LINE"
-    ) || return
+    )
+    __fzf_history_delete "$deletefile"
+    command rm -f "$deletefile"
+    [[ -n $output ]] || return
     READLINE_LINE=${output#*$'\t'}
     if [[ -z $READLINE_POINT ]]; then
       echo "$READLINE_LINE"
@@ -121,7 +138,7 @@ else # awk - fallback for POSIX systems
 fi
 
 # Required to refresh the prompt after fzf
-bind -m emacs-standard '"\er": redraw-current-line'
+bind -m emacs-standard '"\C-\e(": redraw-current-line'
 
 bind -m vi-command '"\C-z": emacs-editing-mode'
 bind -m vi-insert '"\C-z": emacs-editing-mode'
@@ -130,7 +147,7 @@ bind -m emacs-standard '"\C-z": vi-editing-mode'
 if ((BASH_VERSINFO[0] < 4)); then
   # CTRL-T - Paste the selected file path into the command line
   if [[ ${FZF_CTRL_T_COMMAND-x} != "" ]]; then
-    bind -m emacs-standard '"\C-t": " \C-b\C-k \C-u`__fzf_select__`\e\C-e\er\C-a\C-y\C-h\C-e\e \C-y\ey\C-x\C-x\C-f\C-y\ey\C-_"'
+    bind -m emacs-standard '"\C-t": " \C-b\C-k \C-u`__fzf_select__`\e\C-e\C-\e(\C-a\C-y\C-h\C-e\e \C-y\ey\C-x\C-x\C-f\C-y\ey\C-_"'
     bind -m vi-command '"\C-t": "\C-z\C-t\C-z"'
     bind -m vi-insert '"\C-t": "\C-z\C-t\C-z"'
   fi
@@ -140,7 +157,7 @@ if ((BASH_VERSINFO[0] < 4)); then
     if [[ -n ${FZF_CTRL_R_COMMAND-} ]]; then
       echo "warning: FZF_CTRL_R_COMMAND is set to a custom command, but custom commands are not yet supported for CTRL-R" >&2
     fi
-    bind -m emacs-standard '"\C-r": "\C-e \C-u\C-y\ey\C-u`__fzf_history__`\e\C-e\er"'
+    bind -m emacs-standard '"\C-r": "\C-e \C-u\C-y\ey\C-u`__fzf_history__`\e\C-e\C-\e("'
     bind -m vi-command '"\C-r": "\C-z\C-r\C-z"'
     bind -m vi-insert '"\C-r": "\C-z\C-r\C-z"'
   fi
@@ -165,7 +182,7 @@ fi
 
 # ALT-C - cd into the selected directory
 if [[ ${FZF_ALT_C_COMMAND-x} != "" ]]; then
-  bind -m emacs-standard '"\ec": " \C-b\C-k \C-u`__fzf_cd__`\e\C-e\er\C-m\C-y\C-h\e \C-y\ey\C-x\C-x\C-d\C-y\ey\C-_"'
+  bind -m emacs-standard '"\ec": " \C-b\C-k \C-u`__fzf_cd__`\e\C-e\C-\e(\C-m\C-y\C-h\e \C-y\ey\C-x\C-x\C-d\C-y\ey\C-_"'
   bind -m vi-command '"\ec": "\C-z\ec\C-z"'
   bind -m vi-insert '"\ec": "\C-z\ec\C-z"'
 fi
